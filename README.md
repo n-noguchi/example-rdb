@@ -63,7 +63,16 @@ CREATE TABLE users (
 DROP TABLE IF EXISTS users;
 ```
 
-`CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`、単一列・複合`PRIMARY KEY`をサポートします。主キーはNULL値と重複値を拒否します。`CREATE DATABASE`、外部キー、インデックスは未対応です。
+`CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`、単一列・複合`PRIMARY KEY`をサポートします。主キーはNULL値と重複値を拒否します。
+
+セカンダリインデックス（Covering Index）も対応しています:
+
+```sql
+CREATE INDEX idx_users_email ON users(email) INCLUDE (name, active);
+DROP INDEX idx_users_email ON users;
+```
+
+詳細は [Covering Index設計書](docs/COVERING_INDEX_DESIGN.md) を参照してください。
 
 ## 対応機能
 
@@ -76,6 +85,8 @@ DROP TABLE IF EXISTS users;
 | 主キー（単一） | `col type PRIMARY KEY` | 列定義に_inline指定_ |
 | 主キー（複合） | `PRIMARY KEY (col1, col2)` | テーブル制約として指定 |
 | CHECKPOINT | `CHECKPOINT` | Base+Deltaマージ→Arrowファイル書込み→Deltaクリア |
+| セカンダリインデックス作成 | `CREATE INDEX name ON table (cols) [INCLUDE (cols)]` | Covering Index |
+| セカンダリインデックス削除 | `DROP INDEX [IF EXISTS] name ON table` | |
 
 #### 対応データ型
 
@@ -188,12 +199,16 @@ ORDER BY u.name;
 - [設計書](docs/DESIGN.md) — アーキテクチャ全体、データフロー、コンポーネント一覧
 - [クエリ経路シーケンス図](docs/SEQUENCE.md) — SELECT/INSERT/DDL/CHECKPOINT/リカバリのMermaidシーケンス図
 - [WAL+mmap方式設計書](docs/WAL_MMAP_DESIGN.md) — Base+Delta方式のメモリ管理、制限事項
+- [セカンダリインデックス設計書](docs/COVERING_INDEX_DESIGN.md) — Covering Index方式、DML連携、制限事項
 
 ## テストコマンド
 
 ```bash
-# 全テスト（104件）
+# 全テスト（123件）
 docker compose run --rm rdb-dev mvn test
+
+# インデックステストのみ
+docker compose run --rm rdb-dev mvn test -Dtest=SecondaryIndexTest
 
 # UPDATE/DELETEテストのみ
 docker compose run --rm rdb-dev mvn test -Dtest=UpdateDeleteTest

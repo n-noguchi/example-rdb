@@ -31,6 +31,14 @@ public final class JdbcDdlSupport {
             "(?is)^\\s*DELETE\\s+FROM\\s+([^\\s;]+)(?:\\s+WHERE\\s+(.+?))?\\s*;?\\s*$");
     private static final Pattern UPDATE = Pattern.compile(
             "(?is)^\\s*UPDATE\\s+([^\\s]+)\\s+SET\\s+(.+?)(?:\\s+WHERE\\s+(.+?))?\\s*;?\\s*$");
+    private static final Pattern CREATE_INDEX = Pattern.compile(
+            "(?is)^\\s*CREATE\\s+INDEX\\s+(\\w+)\\s+ON\\s+(\\w+)\\s*\\(([^)]+)\\)(?:\\s+INCLUDE\\s*\\(([^)]+)\\))?\\s*;?\\s*$");
+    private static final Pattern DROP_INDEX = Pattern.compile(
+            "(?is)^\\s*DROP\\s+INDEX\\s+(IF\\s+EXISTS\\s+)?(\\w+)\\s+ON\\s+(\\w+)\\s*;?\\s*$");
+    private static final Pattern SELECT_EQ = Pattern.compile(
+            "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+(\\w+)\\s+WHERE\\s+(\\w+)\\s*=\\s*(.+?)(?:\\s+ORDER\\s+BY.*)?(?:\\s+LIMIT.*)?\\s*;?\\s*$");
+    private static final Pattern SELECT_RANGE = Pattern.compile(
+            "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+(\\w+)\\s+WHERE\\s+(\\w+)\\s*(>=|<=|>|<)\\s*(\\S+)(?:\\s+AND\\s+\\3\\s*(>=|<=|>|<)\\s*(\\S+))?(?:\\s+ORDER\\s+BY.*)?(?:\\s+LIMIT.*)?\\s*;?\\s*$");
 
     private JdbcDdlSupport() {
     }
@@ -77,6 +85,7 @@ public final class JdbcDdlSupport {
         private final ExampleRdb database;
         private boolean handledIntercepted;
         private int dmlAffectedRows;
+        private java.sql.ResultSet indexResultSet;
 
         private StatementHandler(Statement delegate, ExampleRdb database) {
             this.delegate = delegate;
@@ -86,20 +95,36 @@ public final class JdbcDdlSupport {
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
             if (isSqlExecution(method, args)) {
-                int affected = executeIntercepted((String) args[0], database, delegate);
+                String sql = (String) args[0];
+                String methodName = method.getName();
+
+                // Try index scan for SELECT
+                if (methodName.equals("executeQuery") || methodName.equals("execute")) {
+                    java.sql.ResultSet idxRs = tryIndexScan(sql, database, delegate);
+                    if (idxRs != null) {
+                        handledIntercepted = true;
+                        dmlAffectedRows = -1;
+                        indexResultSet = idxRs;
+                        if (methodName.equals("executeQuery")) return idxRs;
+                        return true; // execute() returns boolean
+                    }
+                }
+
+                int affected = executeIntercepted(sql, database, delegate);
                 if (affected >= 0) {
                     handledIntercepted = true;
                     dmlAffectedRows = affected;
+                    indexResultSet = null;
                     return executionResult(method.getReturnType(), affected);
                 }
                 handledIntercepted = false;
             }
             if (handledIntercepted) {
                 switch (method.getName()) {
-                    case "getUpdateCount" -> { return dmlAffectedRows; }
-                    case "getLargeUpdateCount" -> { return (long) dmlAffectedRows; }
-                    case "getResultSet" -> { return null; }
-                    case "getMoreResults" -> { return false; }
+                    case "getUpdateCount" -> { return dmlAffectedRows >= 0 ? dmlAffectedRows : -1; }
+                    case "getLargeUpdateCount" -> { return (long) (dmlAffectedRows >= 0 ? dmlAffectedRows : -1); }
+                    case "getResultSet" -> { return indexResultSet; }
+                    case "getMoreResults" -> { indexResultSet = null; return false; }
                 }
             }
             try {
@@ -113,7 +138,7 @@ public final class JdbcDdlSupport {
     private static boolean isSqlExecution(Method method, Object[] args) {
         return args != null && args.length > 0 && args[0] instanceof String
                 && switch (method.getName()) {
-                    case "execute", "executeUpdate", "executeLargeUpdate" -> true;
+                    case "execute", "executeUpdate", "executeLargeUpdate", "executeQuery" -> true;
                     default -> false;
                 };
     }
@@ -151,6 +176,16 @@ public final class JdbcDdlSupport {
         Matcher updateMatcher = UPDATE.matcher(sql);
         if (updateMatcher.matches()) {
             return executeUpdateStmt(updateMatcher, database, delegate);
+        }
+        Matcher createIdxMatcher = CREATE_INDEX.matcher(sql);
+        if (createIdxMatcher.matches()) {
+            executeCreateIndex(createIdxMatcher, database);
+            return 0;
+        }
+        Matcher dropIdxMatcher = DROP_INDEX.matcher(sql);
+        if (dropIdxMatcher.matches()) {
+            executeDropIndex(dropIdxMatcher, database);
+            return 0;
         }
         return -1;
     }
@@ -423,4 +458,232 @@ public final class JdbcDdlSupport {
 
     private record SetAssignment(String column, String expression) {
     }
+
+    // ── Index DDL ──
+
+    private static void executeCreateIndex(Matcher matcher, ExampleRdb database) throws SQLException {
+        String indexName = matcher.group(1);
+        String tableName = unquoteIdentifier(matcher.group(2));
+        List<String> keyCols = parseColumnList(matcher.group(3));
+        List<String> includeCols = matcher.group(4) != null ? parseColumnList(matcher.group(4)) : List.of();
+
+        ExampleTable table = database.getSchema().getExampleTable(tableName);
+        if (table == null) {
+            throw new SQLException("Table not found: " + tableName, "42S02");
+        }
+        if (table.getIndexManager() != null && table.getIndexManager().hasIndex(indexName)) {
+            throw new SQLException("Index already exists: " + indexName, "42P07");
+        }
+
+        try {
+            database.createIndex(tableName, indexName, keyCols, includeCols);
+        } catch (Exception e) {
+            throw new SQLException(e.getMessage(), "42000", e);
+        }
+    }
+
+    private static void executeDropIndex(Matcher matcher, ExampleRdb database) throws SQLException {
+        boolean ifExists = matcher.group(1) != null;
+        String indexName = matcher.group(2);
+        String tableName = unquoteIdentifier(matcher.group(3));
+
+        ExampleTable table = database.getSchema().getExampleTable(tableName);
+        if (table == null) {
+            if (ifExists) return;
+            throw new SQLException("Table not found: " + tableName, "42S02");
+        }
+
+        boolean dropped = database.dropIndex(tableName, indexName);
+        if (!dropped && !ifExists) {
+            throw new SQLException("Index not found: " + indexName, "42704");
+        }
+    }
+
+    private static List<String> parseColumnList(String list) {
+        List<String> cols = new ArrayList<>();
+        for (String part : list.split(",")) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                cols.add(unquoteIdentifier(trimmed));
+            }
+        }
+        return cols;
+    }
+
+    // ── Index Scan Interception ──
+
+    private static java.sql.ResultSet tryIndexScan(String sql, ExampleRdb database, Statement delegate) throws SQLException {
+        Matcher eqMatcher = SELECT_EQ.matcher(sql);
+        if (eqMatcher.matches()) {
+            return tryEqualityIndexScan(eqMatcher, database, delegate);
+        }
+        Matcher rangeMatcher = SELECT_RANGE.matcher(sql);
+        if (rangeMatcher.matches()) {
+            return tryRangeIndexScan(rangeMatcher, database, delegate);
+        }
+        return null;
+    }
+
+    /**
+     * Execute index scan and return results via a temporary Calcite table.
+     * This avoids implementing ResultSet from scratch.
+     */
+    private static java.sql.ResultSet returnIndexResult(
+            List<String> columnNames, List<Object[]> rows,
+            ExampleRdb database, Statement delegate,
+            ExampleTable table) throws SQLException {
+
+        if (rows.isEmpty()) {
+            // Return empty result via Calcite query on the original table with LIMIT 0
+            String colList = String.join(",", columnNames);
+            return delegate.executeQuery("SELECT " + colList + " FROM " + table.getTableName() + " WHERE 1 = 0");
+        }
+
+        // Build VALUES clause: SELECT * FROM (VALUES (...), (...)) AS t(col1, col2)
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT * FROM (VALUES ");
+        for (int i = 0; i < rows.size(); i++) {
+            if (i > 0) sql.append(", ");
+            sql.append("(");
+            for (int j = 0; j < rows.get(i).length; j++) {
+                if (j > 0) sql.append(", ");
+                sql.append(formatSqlLiteral(rows.get(i)[j]));
+            }
+            sql.append(")");
+        }
+        sql.append(") AS t(");
+        for (int i = 0; i < columnNames.size(); i++) {
+            if (i > 0) sql.append(", ");
+            sql.append(columnNames.get(i));
+        }
+        sql.append(")");
+
+        return delegate.executeQuery(sql.toString());
+    }
+
+    private static String formatSqlLiteral(Object value) {
+        if (value == null) return "NULL";
+        if (value instanceof Boolean b) return b ? "TRUE" : "FALSE";
+        if (value instanceof Number n) return n.toString();
+        // String literal - escape single quotes
+        return "'" + value.toString().replace("'", "''") + "'";
+    }
+
+    private static ExampleTable.ColumnDef findColumnDefByName(ExampleTable table, String colName) {
+        for (ExampleTable.ColumnDef col : table.getColumns()) {
+            if (col.name.equalsIgnoreCase(colName)) return col;
+        }
+        return null;
+    }
+
+    private static java.sql.ResultSet tryEqualityIndexScan(Matcher matcher, ExampleRdb database, Statement delegate) throws SQLException {
+        String colList = matcher.group(1).trim();
+        String tableName = unquoteIdentifier(matcher.group(2));
+        String whereCol = unquoteIdentifier(matcher.group(3));
+        String valueStr = matcher.group(4).trim();
+
+        ExampleTable table = database.getSchema().getExampleTable(tableName);
+        if (table == null || table.getIndexManager() == null) return null;
+
+        List<String> requestedCols = parseSelectColumns(colList);
+        if (requestedCols.isEmpty()) return null;
+
+        Object keyValue = parseLiteral(valueStr, table, whereCol);
+        if (keyValue == null && !valueStr.equalsIgnoreCase("NULL")) return null;
+
+        var scanResult = table.getIndexManager().scanCovering(whereCol, keyValue, requestedCols);
+        if (scanResult == null) return null;
+
+        List<Object[]> rows = scanResult.toRows(requestedCols);
+        return returnIndexResult(requestedCols, rows, database, delegate, table);
+    }
+
+    private static java.sql.ResultSet tryRangeIndexScan(Matcher matcher, ExampleRdb database, Statement delegate) throws SQLException {
+        String colList = matcher.group(1).trim();
+        String tableName = unquoteIdentifier(matcher.group(2));
+        String whereCol = unquoteIdentifier(matcher.group(3));
+        String op1 = matcher.group(4);
+        String val1 = matcher.group(5).trim();
+        String op2 = matcher.group(6);
+        String val2 = matcher.group(7);
+
+        ExampleTable table = database.getSchema().getExampleTable(tableName);
+        if (table == null || table.getIndexManager() == null) return null;
+
+        List<String> requestedCols = parseSelectColumns(colList);
+        if (requestedCols.isEmpty()) return null;
+
+        // Build lower/upper bounds
+        Object lower = null, upper = null;
+        boolean lowerInclusive = false, upperInclusive = false;
+
+        var bound1 = toBound(op1, val1, table, whereCol);
+        if (bound1 != null) {
+            if (bound1.type == BoundType.LOWER) { lower = bound1.value; lowerInclusive = bound1.inclusive; }
+            else { upper = bound1.value; upperInclusive = bound1.inclusive; }
+        }
+        if (op2 != null && val2 != null) {
+            var bound2 = toBound(op2, val2, table, whereCol);
+            if (bound2 != null) {
+                if (bound2.type == BoundType.LOWER) { lower = bound2.value; lowerInclusive = bound2.inclusive; }
+                else { upper = bound2.value; upperInclusive = bound2.inclusive; }
+            }
+        }
+
+        var scanResult = table.getIndexManager().scanRange(whereCol, lower, lowerInclusive,
+                upper, upperInclusive, requestedCols);
+        if (scanResult == null) return null;
+
+        List<Object[]> rows = scanResult.toRows(requestedCols);
+        return returnIndexResult(requestedCols, rows, database, delegate, table);
+    }
+
+    private enum BoundType { LOWER, UPPER }
+    private record Bound(BoundType type, Object value, boolean inclusive) {}
+
+    private static Bound toBound(String op, String valStr, ExampleTable table, String colName) {
+        Object value = parseLiteral(valStr, table, colName);
+        if (value == null && !valStr.trim().equalsIgnoreCase("NULL")) return null;
+        return switch (op) {
+            case ">" -> new Bound(BoundType.LOWER, value, false);
+            case ">=" -> new Bound(BoundType.LOWER, value, true);
+            case "<" -> new Bound(BoundType.UPPER, value, false);
+            case "<=" -> new Bound(BoundType.UPPER, value, true);
+            default -> null;
+        };
+    }
+
+    private static List<String> parseSelectColumns(String colList) {
+        if (colList.equals("*")) return null; // Can't determine columns for *
+        List<String> cols = new ArrayList<>();
+        for (String part : colList.split(",")) {
+            String trimmed = part.trim();
+            // Handle "col AS alias" or "table.col"
+            String colName = trimmed.replaceAll("\\s+AS\\s+.*$", "").replaceAll("^\\w+\\.", "");
+            cols.add(unquoteIdentifier(colName));
+        }
+        return cols;
+    }
+
+    private static Object parseLiteral(String valueStr, ExampleTable table, String colName) {
+        valueStr = valueStr.trim();
+        // Remove trailing semicolons or extra clauses
+        if (valueStr.endsWith(";")) valueStr = valueStr.substring(0, valueStr.length() - 1).trim();
+
+        if (valueStr.equalsIgnoreCase("NULL")) return null;
+        if (valueStr.equalsIgnoreCase("TRUE")) return true;
+        if (valueStr.equalsIgnoreCase("FALSE")) return false;
+
+        // String literal
+        if ((valueStr.startsWith("'") && valueStr.endsWith("'"))
+                || (valueStr.startsWith("\"") && valueStr.endsWith("\""))) {
+            return valueStr.substring(1, valueStr.length() - 1);
+        }
+
+        // Numeric
+        try { return Integer.parseInt(valueStr); } catch (NumberFormatException ignored) {}
+        try { return Double.parseDouble(valueStr); } catch (NumberFormatException ignored) {}
+        return valueStr;
+    }
+
 }

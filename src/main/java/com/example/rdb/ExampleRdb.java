@@ -85,6 +85,21 @@ public class ExampleRdb {
             if (Files.exists(arrowFile)) {
                 table.setBaseDataPath(arrowFile);
             }
+
+            // Restore indexes
+            if (!def.indexes.isEmpty() && storage != null) {
+                Path indexDir = dataDir.resolve("indexes").resolve(def.name);
+                com.example.rdb.index.IndexManager idxMgr = new com.example.rdb.index.IndexManager(
+                        def.name, table.getColumns(), storage.getAllocator(),
+                        indexDir, table.getRowIdGenerator());
+                table.setIndexManager(idxMgr);
+
+                for (CatalogManager.IndexDef idxDef : def.indexes) {
+                    com.example.rdb.index.IndexDefinition indexDef = new com.example.rdb.index.IndexDefinition(
+                            idxDef.name, def.name, idxDef.keyColumns, idxDef.includeColumns, false);
+                    idxMgr.registerIndex(indexDef);
+                }
+            }
         }
 
         applyWalRecords();
@@ -149,6 +164,9 @@ public class ExampleRdb {
         if (table == null) return false;
 
         try {
+            if (table.getIndexManager() != null) {
+                table.getIndexManager().dropAll();
+            }
             if (dataDir != null) {
                 Files.deleteIfExists(dataDir.resolve("tables").resolve(tableName + ".arrow"));
             }
@@ -182,6 +200,71 @@ public class ExampleRdb {
             throw new IllegalArgumentException("Table not found: " + tableName);
         }
         table.addRow(values);
+    }
+
+    public void createIndex(String tableName, String indexName,
+                            List<String> keyColumns, List<String> includeColumns) {
+        ExampleTable table = schema.getExampleTable(tableName);
+        if (table == null) {
+            throw new IllegalArgumentException("Table not found: " + tableName);
+        }
+
+        if (table.getIndexManager() == null) {
+            Path indexDir = dataDir != null ? dataDir.resolve("indexes").resolve(tableName) : null;
+            table.setIndexManager(new com.example.rdb.index.IndexManager(
+                    tableName, table.getColumns(),
+                    storage != null ? storage.getAllocator() : null,
+                    indexDir, table.getRowIdGenerator()));
+        }
+
+        com.example.rdb.index.IndexDefinition def = new com.example.rdb.index.IndexDefinition(
+                indexName, tableName, keyColumns, includeColumns, false);
+
+        // Get snapshot of all rows for index construction
+        List<Object[]> snapshotRows = getSnapshotRows(table);
+        List<Long> snapshotRowIds = getSnapshotRowIds(table);
+
+        table.getIndexManager().createIndex(def, snapshotRows, snapshotRowIds);
+        persistCatalog();
+    }
+
+    public boolean dropIndex(String tableName, String indexName) {
+        ExampleTable table = schema.getExampleTable(tableName);
+        if (table == null || table.getIndexManager() == null) return false;
+        if (!table.getIndexManager().hasIndex(indexName)) return false;
+
+        table.getIndexManager().dropIndex(indexName);
+        persistCatalog();
+        return true;
+    }
+
+    private List<Object[]> getSnapshotRows(ExampleTable table) {
+        List<Object[]> rows = new java.util.ArrayList<>();
+        if (storage != null && dataDir != null && table.getBaseDataPath() != null) {
+            try {
+                rows.addAll(storage.readTable(table.getBaseDataPath(), table.getColumns()));
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to read base data for snapshot", e);
+            }
+        }
+        rows.addAll(table.getDeltaRows());
+        return rows;
+    }
+
+    private List<Long> getSnapshotRowIds(ExampleTable table) {
+        List<Long> ids = new java.util.ArrayList<>();
+        if (storage != null && dataDir != null && table.getBaseDataPath() != null) {
+            try {
+                int baseCount = storage.readTable(table.getBaseDataPath(), table.getColumns()).size();
+                for (int i = 0; i < baseCount; i++) {
+                    ids.add((long) i);
+                }
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to read base data for row IDs", e);
+            }
+        }
+        ids.addAll(table.getDeltaRowIds());
+        return ids;
     }
 
     public Connection getConnection() throws SQLException {

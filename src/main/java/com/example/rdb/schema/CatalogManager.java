@@ -1,5 +1,6 @@
 package com.example.rdb.schema;
 
+import com.example.rdb.index.IndexDefinition;
 import org.apache.calcite.sql.type.SqlTypeName;
 
 import java.io.IOException;
@@ -38,7 +39,35 @@ public class CatalogManager {
                 if (i > 0) sb.append(',');
                 sb.append("\"").append(escape(table.getPrimaryKeyColumns().get(i))).append("\"");
             }
-            sb.append("]}");
+            sb.append("]");
+
+            // Index definitions
+            if (table.getIndexManager() != null) {
+                List<IndexDefinition> indexes = table.getIndexManager().getDefinitions();
+                if (!indexes.isEmpty()) {
+                    sb.append(",\"indexes\":[");
+                    boolean firstIdx = true;
+                    for (IndexDefinition idx : indexes) {
+                        if (!firstIdx) sb.append(',');
+                        firstIdx = false;
+                        sb.append("{\"name\":\"").append(escape(idx.name())).append("\"");
+                        sb.append(",\"keyColumns\":[");
+                        for (int i = 0; i < idx.keyColumns().size(); i++) {
+                            if (i > 0) sb.append(',');
+                            sb.append("\"").append(escape(idx.keyColumns().get(i))).append("\"");
+                        }
+                        sb.append("],\"includeColumns\":[");
+                        for (int i = 0; i < idx.includeColumns().size(); i++) {
+                            if (i > 0) sb.append(',');
+                            sb.append("\"").append(escape(idx.includeColumns().get(i))).append("\"");
+                        }
+                        sb.append("]}");
+                    }
+                    sb.append("]");
+                }
+            }
+
+            sb.append("}");
         }
         sb.append("]}");
         Files.writeString(catalogPath, sb.toString(), StandardCharsets.UTF_8);
@@ -74,7 +103,7 @@ public class CatalogManager {
             int colArrStart = obj.indexOf("\"columns\"");
             if (colArrStart >= 0) {
                 int arrStart = obj.indexOf('[', colArrStart);
-                int arrEnd = obj.indexOf(']', arrStart);
+                int arrEnd = findMatchingBracket(obj, arrStart);
                 String colArr = obj.substring(arrStart + 1, arrEnd);
                 int cp = 0;
                 while (cp < colArr.length()) {
@@ -89,9 +118,39 @@ public class CatalogManager {
                 }
             }
 
-            tables.add(new TableDef(name, columns, extractStringArray(obj, "primaryKey")));
+            List<String> primaryKey = extractStringArray(obj, "primaryKey");
+            List<IndexDef> indexes = parseIndexes(obj);
+
+            tables.add(new TableDef(name, columns, primaryKey, indexes));
             pos = objEnd + 1;
         }
+    }
+
+    private List<IndexDef> parseIndexes(String obj) {
+        List<IndexDef> indexes = new ArrayList<>();
+        int idxStart = obj.indexOf("\"indexes\"");
+        if (idxStart < 0) return indexes;
+
+        int arrStart = obj.indexOf('[', idxStart);
+        int arrEnd = findMatchingBracket(obj, arrStart);
+        if (arrStart < 0 || arrEnd < 0) return indexes;
+
+        String arr = obj.substring(arrStart + 1, arrEnd);
+        int cp = 0;
+        while (cp < arr.length()) {
+            int cs = arr.indexOf('{', cp);
+            if (cs < 0) break;
+            int ce = findMatchingBrace(arr, cs);
+            String idxObj = arr.substring(cs, ce + 1);
+
+            String idxName = extractString(idxObj, "name");
+            List<String> keyCols = extractStringArray(idxObj, "keyColumns");
+            List<String> incCols = extractStringArray(idxObj, "includeColumns");
+            indexes.add(new IndexDef(idxName, keyCols, incCols));
+
+            cp = ce + 1;
+        }
+        return indexes;
     }
 
     private int findMatchingBrace(String s, int start) {
@@ -100,6 +159,16 @@ public class CatalogManager {
             char c = s.charAt(i);
             if (c == '{') depth++;
             else if (c == '}') { depth--; if (depth == 0) return i; }
+        }
+        return -1;
+    }
+
+    private int findMatchingBracket(String s, int start) {
+        int depth = 0;
+        for (int i = start; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '[') depth++;
+            else if (c == ']') { depth--; if (depth == 0) return i; }
         }
         return -1;
     }
@@ -119,7 +188,7 @@ public class CatalogManager {
         int keyStart = json.indexOf("\"" + key + "\"");
         if (keyStart < 0) return values;
         int start = json.indexOf('[', keyStart);
-        int end = json.indexOf(']', start);
+        int end = findMatchingBracket(json, start);
         if (start < 0 || end < 0) return values;
         String array = json.substring(start + 1, end);
         for (String value : array.split(",")) {
@@ -139,11 +208,18 @@ public class CatalogManager {
         public final String name;
         public final List<ColumnDef> columns;
         public final List<String> primaryKeyColumns;
+        public final List<IndexDef> indexes;
 
         public TableDef(String name, List<ColumnDef> columns, List<String> primaryKeyColumns) {
+            this(name, columns, primaryKeyColumns, List.of());
+        }
+
+        public TableDef(String name, List<ColumnDef> columns, List<String> primaryKeyColumns,
+                        List<IndexDef> indexes) {
             this.name = name;
             this.columns = columns;
             this.primaryKeyColumns = primaryKeyColumns;
+            this.indexes = indexes != null ? indexes : List.of();
         }
     }
 
@@ -154,6 +230,18 @@ public class CatalogManager {
         public ColumnDef(String name, SqlTypeName typeName) {
             this.name = name;
             this.typeName = typeName;
+        }
+    }
+
+    public static class IndexDef {
+        public final String name;
+        public final List<String> keyColumns;
+        public final List<String> includeColumns;
+
+        public IndexDef(String name, List<String> keyColumns, List<String> includeColumns) {
+            this.name = name;
+            this.keyColumns = keyColumns;
+            this.includeColumns = includeColumns;
         }
     }
 }

@@ -99,7 +99,8 @@ loadtest/
 │   ├── 02-read-products.js   # シナリオ2: SELECT多発（商品検索）
 │   ├── 03-mixed-workload.js  # シナリオ3: 読み書き混合（ショッピング）
 │   ├── 04-update-stock.js    # シナリオ4: UPDATE多発（在庫更新）
-│   └── 05-delete-old.js      # シナリオ5: DELETE（旧データ削除）
+│   ├── 05-delete-old.js      # シナリオ5: DELETE（旧データ削除）
+│   └── 06-covering-index.js  # シナリオ6: Covering Index Scan（等価検索）
 └── README.md                 # 本ファイル
 ```
 
@@ -168,29 +169,29 @@ docker compose up -d rdb-server
 - k6: Docker コンテナ、同一Dockerネットワーク（example-rdb-net）
 - テストデータ: products 100行（5カテゴリ）、orders はシナリオごとに生成
 
-### シナリオ別サマリー
+### シナリオ別サマリー（第2回 — ConcurrentModificationException修正後 + Covering Index追加）
 
 | シナリオ | DML | VU数 | イテレーション | スループット | avg | p(95) | checks |
 |----------|-----|------|---------------|-------------|------|-------|--------|
-| 01-write-orders | INSERT | 5 | 28,930 | 154/s | 31.08ms | 43.27ms | 100% |
-| 02-read-products | SELECT | 10 | 83,782 | 447/s | 21.47ms | 33.36ms | 100% |
-| 03-mixed-workload | SELECT+INSERT | 5 | 18,135 | 97/s | 49.61ms | 68.01ms | 100% |
-| 04-update-stock | UPDATE | 5 | 37,270 | 199/s | 24.09ms | 34.80ms | 100% |
-| 05-delete-old | DELETE | 3 | 18,644 | 100/s | 28.95ms | 36.56ms | 100% |
+| 01-write-orders | INSERT | 5 | 27,089 | 144/s | 33.21ms | 42.58ms | 100% |
+| 02-read-products | SELECT | 10 | 83,429 | 446/s | 21.56ms | 33.20ms | 100% |
+| 03-mixed-workload | SELECT+INSERT | 5 | 17,004 | 91/s | 52.93ms | 71.26ms | 100% |
+| 04-update-stock | UPDATE | 5 | 37,805 | 202/s | 23.75ms | 33.69ms | 100% |
+| 05-delete-old | DELETE | 3 | 19,148 | 103/s | 28.19ms | 35.91ms | 100% |
+| **06-covering-index** | **SELECT (Index)** | **10** | **120,365** | **639/s** | **14.94ms** | **23.20ms** | **100%** |
 
-> **全シナリオで checks 100%**（成功）。ただし書き込み系シナリオでは一部 `ConcurrentModificationException` が発生（後述）。
+> 全シナリオで checks 100%、エラーなし。ConcurrentModificationExceptionはゼロ件。
 
-### 発見された問題
+### Covering Index vs Full Scan 比較
 
-#### ConcurrentModificationException（書き込み系マルチVU）
-
-INSERT/UPDATE/DELETE を複数VUで並行実行すると、ごくまれに `ConcurrentModificationException` が発生します。
-
-**原因**: Example RDBの内部データ構造（`ArrayList`）がスレッドセーフではないため、Avaticaサーバーが複数のリクエストを並行処理すると競合が発生します。`ExampleTable` の `synchronized` メソッドで一部保護されていますが、スキャン中の反復と追加が競合するケースがあります。
-
-**影響**: エラーが発生したイテレーションは失敗しますが、k6は他のイテレーションを継続します。データの整合性は保たれます（WALが正しく書き込まれた後のみメモリに反映されるため）。
-
-**対応**: 排他制御（ロック機構）の実装で解決可能です。学習用RDBの既知の制限事項として記載しています。
+| 項目 | 02-read-products (Full Scan) | 06-covering-index (Index Scan) | 差 |
+|------|------|------|-----|
+| VU数 | 10 | 10 | 同条件 |
+| データ件数 | 100行 | 100行 | 同条件 |
+| クエリ | SELECT+WHERE+GROUP BY 3パターン | SELECT WHERE col=val (Index Only) | — |
+| スループット | 446/s | 639/s | **1.43倍** |
+| avgレイテンシ | 21.56ms | 14.94ms | **31%短縮** |
+| p(95)レイテンシ | 33.20ms | 23.20ms | **30%短縮** |
 
 ---
 
@@ -199,22 +200,21 @@ INSERT/UPDATE/DELETE を複数VUで並行実行すると、ごくまれに `Conc
 ```
      ✓ order count returned
 
-     checks...............: 100.00% 25552 out of 25552
+     checks...............: 100.00% 27089 out of 27089
      data_received........: 0 B     0 B/s
      data_sent............: 0 B     0 B/s
-   ✓ iteration_duration...: avg=31.08ms min=5.81ms med=31.6ms max=527.2ms p(90)=38.45ms p(95)=43.27ms
-     iterations...........: 28930   154.353099/s
+   ✓ iteration_duration...: avg=33.21ms min=22.92ms med=31.87ms max=519.38ms p(90)=37.56ms p(95)=42.58ms
+     iterations...........: 27089   144.529437/s
      vus..................: 5       min=0              max=5
      vus_max..............: 5       min=5              max=5
 
 
-running (3m07.4s), 0/5 VUs, 28930 complete and 0 interrupted iterations
+running (3m07.4s), 0/5 VUs, 27089 complete and 0 interrupted iterations
 default ✓ [ 100% ] 5 VUs  3m0s
 ```
 
-- ティアダウン時: `total orders = 25,552`
-- 28,930イテレーション中 25,552件のINSERT成功（3,378件は終盤のConcurrentModificationExceptionで失敗）
-- p(95) = 43ms、スループット約 154 INSERT/s
+- ティアダウン時: `total orders = 27,089`
+- エラーなし（CopyOnWriteArrayList修正後）
 
 ### シナリオ2: SELECT多発（02-read-products.js）— 3分
 
@@ -223,22 +223,20 @@ default ✓ [ 100% ] 5 VUs  3m0s
      ✓ filter query executed
      ✓ aggregate query returned rows
 
-     checks...............: 100.00% 83782 out of 83782
+     checks...............: 100.00% 83429 out of 83429
      data_received........: 0 B     0 B/s
      data_sent............: 0 B     0 B/s
-   ✓ iteration_duration...: avg=21.47ms min=8.74ms med=21.11ms max=245.09ms p(90)=27.72ms p(95)=33.36ms
-     iterations...........: 83782   447.330478/s
+   ✓ iteration_duration...: avg=21.56ms min=8.15ms med=21.21ms max=283.5ms p(90)=27.71ms p(95)=33.2ms
+     iterations...........: 83429   445.572756/s
      vus..................: 10      min=0              max=10
      vus_max..............: 10      min=10             max=10
 
 
-running (3m07.3s), 00/10 VUs, 83782 complete and 0 interrupted iterations
+running (3m07.2s), 00/10 VUs, 83429 complete and 0 interrupted iterations
 default ✓ [ 100% ] 10 VUs  3m0s
 ```
 
-- **エラーなし**。SELECT専用のため並行性の問題は発生しない
-- 10VUで 83,782イテレーション、スループット約 447 SELECT/s
-- 3パターン（全件LIMIT / WHERE+ORDER BY / GROUP BY集計）を循環実行
+- エラーなし。10VUで 83,429イテレーション、スループット約 446 SELECT/s
 
 ### シナリオ3: 読み書き混合（03-mixed-workload.js）— 3分
 
@@ -246,47 +244,45 @@ default ✓ [ 100% ] 10 VUs  3m0s
      ✓ products found
      ✓ history returned
 
-     checks...............: 100.00% 35262 out of 35262
+     checks...............: 100.00% 34008 out of 34008
      data_received........: 0 B     0 B/s
      data_sent............: 0 B     0 B/s
-   ✓ iteration_duration...: avg=49.61ms min=22.19ms med=47.26ms max=365.85ms p(90)=59.48ms p(95)=68.01ms
-     iterations...........: 18135   96.784932/s
-     vus..................: 5       min=5              max=5
+   ✓ iteration_duration...: avg=52.93ms min=39.54ms med=49.95ms max=372.9ms p(90)=61.71ms p(95)=71.26ms
+     iterations...........: 17004   90.745702/s
+     vus..................: 5       min=0              max=5
      vus_max..............: 5       min=5              max=5
 
 
-running (3m07.4s), 0/5 VUs, 18135 complete and 0 interrupted iterations
+running (3m07.4s), 0/5 VUs, 17004 complete and 0 interrupted iterations
 default ✓ [ 100% ] 5 VUs  3m0s
 ```
 
-- ティアダウン時: `total orders = 17,127`
-- 1イテレーション = 3クエリ（SELECT + INSERT + SELECT）のため、iteration_durationは他より高め
-- avg=49.61ms、p(95)=68.01ms
+- エラーなし（CopyOnWriteArrayList修正後）
 
 ### シナリオ4: UPDATE多発（04-update-stock.js）— 3分
 
 ```
      ✓ stock readable
 
-     checks...............: 100.00% 12425 out of 12425
+     checks...............: 100.00% 12604 out of 12604
      data_received........: 0 B     0 B/s
      data_sent............: 0 B     0 B/s
-   ✓ iteration_duration...: avg=24.09ms min=10.62ms med=25.08ms max=300.11ms p(90)=30.58ms p(95)=34.8ms
-     iterations...........: 37270   198.69603/s
-     vus..................: 5       min=5              max=5
+   ✓ iteration_duration...: avg=23.75ms min=10.91ms med=24.86ms max=285.52ms p(90)=29.83ms p(95)=33.69ms
+     iterations...........: 37805   201.691537/s
+     vus..................: 5       min=0              max=5
      vus_max..............: 5       min=5              max=5
 
 
-running (3m07.6s), 0/5 VUs, 37270 complete and 0 interrupted iterations
+running (3m07.4s), 0/5 VUs, 37805 complete and 0 interrupted iterations
 default ✓ [ 100% ] 5 VUs  3m0s
 ```
 
 - ティアダウン時カテゴリ別統計:
-  - books: 20 products, avg_price=59
-  - clothing: 20 products, avg_price=7
-  - electronics: 20 products, avg_price=75
-  - food: 20 products, avg_price=42
-  - toys: 20 products, avg_price=34
+  - books: 20 products, avg_price=37
+  - clothing: 20 products, avg_price=59
+  - electronics: 20 products, avg_price=83
+  - food: 20 products, avg_price=48
+  - toys: 20 products, avg_price=14
 - 3パターン（個別在庫更新 / カテゴリ別価格変更 / 在庫補充）を循環実行
 
 ### シナリオ5: DELETE多発（05-delete-old.js）— 3分
@@ -294,19 +290,40 @@ default ✓ [ 100% ] 5 VUs  3m0s
 ```
      ✓ count returned
 
-     checks...............: 100.00% 18644 out of 18644
+     checks...............: 100.00% 19148 out of 19148
      data_received........: 0 B     0 B/s
      data_sent............: 0 B     0 B/s
-   ✓ iteration_duration...: avg=28.95ms min=21.15ms med=28.04ms max=242.53ms p(95)=36.56ms
-     iterations...........: 18644   100.082023/s
+   ✓ iteration_duration...: avg=28.19ms min=20.37ms med=27.3ms max=236.09ms p(90)=32.45ms p(95)=35.91ms
+     iterations...........: 19148   102.775892/s
      vus..................: 3       min=3              max=3
      vus_max..............: 3       min=3              max=3
 
 
-running (3m06.3s), 0/3 VUs, 18644 complete and 0 interrupted iterations
+running (3m06.3s), 0/3 VUs, 19148 complete and 0 interrupted iterations
 default ✓ [ 100% ] 3 VUs  3m0s
 ```
 
 - ティアダウン時: `remaining orders = 13`
 - 3パターン（個別削除 / キャンセル済み一括削除 / 条件削除）を循環実行
-- データ枯渇時は自動補充（10行INSERT）で継続
+
+### シナリオ6: Covering Index Scan（06-covering-index.js）— 3分
+
+```
+     ✓ index scan returned rows
+
+     checks...............: 100.00% 120365 out of 120365
+     data_received........: 0 B     0 B/s
+     data_sent............: 0 B     0 B/s
+   ✓ iteration_duration...: avg=14.94ms min=7.4ms med=13.55ms max=205.05ms p(90)=18.89ms p(95)=23.2ms
+     iterations...........: 120365  638.732972/s
+     vus..................: 10      min=0                max=10
+     vus_max..............: 10      min=10               max=10
+
+
+running (3m08.4s), 00/10 VUs, 120365 complete and 0 interrupted iterations
+default ✓ [ 100% ] 10 VUs  3m0s
+```
+
+- テストデータ: products 100行、Covering Index `idx_products_cat(category) INCLUDE (name, price, stock)`
+- クエリ: `SELECT name, price, stock FROM products WHERE category = 'electronics'`（等価検索、Index Only Scan）
+- Full Scan（シナリオ02）と比較してスループット **1.43倍**、p(95)レイテンシ **30%短縮**

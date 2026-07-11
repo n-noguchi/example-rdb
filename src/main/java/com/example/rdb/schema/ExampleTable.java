@@ -36,6 +36,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.example.rdb.index.IndexManager;
 
 public class ExampleTable extends AbstractTable implements ScannableTable, ModifiableTable {
 
@@ -44,9 +47,12 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
     private final List<String> primaryKeyColumns;
     private final List<Object[]> deltaRows;
     private final List<Object[]> deletedRows;
+    private final List<Long> deltaRowIds = new CopyOnWriteArrayList<>();
+    private final AtomicLong rowIdGenerator = new AtomicLong(0);
     private Path baseDataPath;
     private BufferAllocator allocator;
     private WalAware walAware;
+    private IndexManager indexManager;
 
     public ExampleTable(String tableName, List<ColumnDef> columns) {
         this(tableName, columns, List.of());
@@ -198,14 +204,26 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
 
     public synchronized void addRow(Object[] values) {
         validatePrimaryKey(values);
+        long rowId = rowIdGenerator.getAndIncrement();
+        deltaRowIds.add(rowId);
+        if (indexManager != null) {
+            indexManager.onInsert(rowId, values);
+        }
         deltaRows.add(values);
     }
 
     public synchronized void deleteRows(List<Object[]> rows) {
         for (Object[] row : rows) {
-            removeRowInternal(row);
+            int idx = removeRowInternal(row);
+            long rowId = idx >= 0 ? deltaRowIds.remove(idx) : -1;
             if (walAware != null) {
                 walAware.onDelete(tableName, toValueMap(row));
+            }
+            if (indexManager != null && rowId >= 0) {
+                indexManager.onDelete(rowId, row);
+            } else if (indexManager != null) {
+                // Base row deletion - can't track exact rowId, add tombstone by value
+                indexManager.onDelete(-1, row);
             }
         }
     }
@@ -214,14 +232,15 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         removeRowInternal(row);
     }
 
-    private void removeRowInternal(Object[] row) {
+    private int removeRowInternal(Object[] row) {
         for (int i = deltaRows.size() - 1; i >= 0; i--) {
             if (rowsEqual(deltaRows.get(i), row)) {
                 deltaRows.remove(i);
-                return;
+                return i;
             }
         }
         deletedRows.add(row);
+        return -1;
     }
 
     public synchronized void applyUpdates(List<Object[]> oldRows, List<Object[]> newRows) {
@@ -229,13 +248,18 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
             Object[] oldRow = oldRows.get(i);
             Object[] newRow = newRows.get(i);
 
-            removeRowInternal(oldRow);
+            int idx = removeRowInternal(oldRow);
+            long rowId = idx >= 0 ? deltaRowIds.remove(idx) : rowIdGenerator.getAndIncrement();
             validatePrimaryKey(newRow);
+            deltaRowIds.add(rowId);
             deltaRows.add(newRow);
 
             if (walAware != null) {
                 walAware.onDelete(tableName, toValueMap(oldRow));
                 walAware.onInsert(tableName, toValueMap(newRow));
+            }
+            if (indexManager != null) {
+                indexManager.onUpdate(rowId, oldRow, newRow);
             }
         }
     }
@@ -268,7 +292,24 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
 
     public synchronized void clearDelta() {
         deltaRows.clear();
+        deltaRowIds.clear();
         deletedRows.clear();
+    }
+
+    public List<Long> getDeltaRowIds() {
+        return deltaRowIds;
+    }
+
+    public AtomicLong getRowIdGenerator() {
+        return rowIdGenerator;
+    }
+
+    public void setIndexManager(IndexManager indexManager) {
+        this.indexManager = indexManager;
+    }
+
+    public IndexManager getIndexManager() {
+        return indexManager;
     }
 
     public List<Object[]> getDeltaRows() {
@@ -322,8 +363,13 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         public synchronized boolean add(Object e) {
             Object[] row = ensureArray(e);
             validatePrimaryKey(row);
+            long rowId = rowIdGenerator.getAndIncrement();
+            deltaRowIds.add(rowId);
             if (walAware != null) {
                 walAware.onInsert(tableName, toMap(row));
+            }
+            if (indexManager != null) {
+                indexManager.onInsert(rowId, row);
             }
             return deltaRows.add(row);
         }
