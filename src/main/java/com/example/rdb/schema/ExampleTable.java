@@ -35,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 public class ExampleTable extends AbstractTable implements ScannableTable, ModifiableTable {
 
@@ -55,8 +56,8 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         this.tableName = tableName;
         this.columns = List.copyOf(columns);
         this.primaryKeyColumns = List.copyOf(primaryKeyColumns);
-        this.deltaRows = new ArrayList<>();
-        this.deletedRows = new ArrayList<>();
+        this.deltaRows = new CopyOnWriteArrayList<>();
+        this.deletedRows = new CopyOnWriteArrayList<>();
         validatePrimaryKeyColumns();
     }
 
@@ -265,7 +266,7 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         return a.equals(b);
     }
 
-    public void clearDelta() {
+    public synchronized void clearDelta() {
         deltaRows.clear();
         deletedRows.clear();
     }
@@ -318,7 +319,7 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
     private class WalBackedCollection extends AbstractCollection {
 
         @Override
-        public boolean add(Object e) {
+        public synchronized boolean add(Object e) {
             Object[] row = ensureArray(e);
             validatePrimaryKey(row);
             if (walAware != null) {
@@ -328,10 +329,10 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         }
 
         @Override
-        public boolean remove(Object o) {
+        public synchronized boolean remove(Object o) {
             Object[] target = ensureArray(o);
             for (int i = 0; i < deltaRows.size(); i++) {
-                if (java.util.Arrays.equals(deltaRows.get(i), target)) {
+                if (Arrays.equals(deltaRows.get(i), target)) {
                     deltaRows.remove(i);
                     return true;
                 }
