@@ -1,0 +1,18 @@
+services:
+  k6:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: example-rdb-k6
+    volumes:
+      # スクリプトはコンテナ外で管理
+      - ./scripts:/scripts:ro
+    networks:
+      - example-rdb-net
+    # 使用例: docker compose run --rm k6 run /scripts/connectivity.js
+    entrypoint: ["k6"]
+    command: ["run", "/scripts/connectivity.js"]
+
+networks:
+  example-rdb-net:
+    external: true

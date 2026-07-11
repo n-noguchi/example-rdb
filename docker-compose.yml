@@ -12,6 +12,8 @@ services:
     working_dir: /app
     tty: true
     stdin_open: true
+    networks:
+      - example-rdb-net
 
   rdb-server:
     build:
@@ -24,6 +26,13 @@ services:
       - .:/app
       - maven-cache:/root/.m2
     working_dir: /app
+    networks:
+      - example-rdb-net
 
 volumes:
   maven-cache:
+
+networks:
+  example-rdb-net:
+    name: example-rdb-net
+    driver: bridge

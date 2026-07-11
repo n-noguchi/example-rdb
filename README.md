@@ -189,7 +189,7 @@ ORDER BY u.name;
 - [クエリ経路シーケンス図](docs/SEQUENCE.md) — SELECT/INSERT/DDL/CHECKPOINT/リカバリのMermaidシーケンス図
 - [WAL+mmap方式設計書](docs/WAL_MMAP_DESIGN.md) — Base+Delta方式のメモリ管理、制限事項
 
-## よく使うコマンド
+## テストコマンド
 
 ```bash
 # 全テスト（104件）
