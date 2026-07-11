@@ -2,6 +2,8 @@
 
 Apache Calcite（SQLエンジン）とApache Arrow（列指向ストレージ）を使った学習用シンプルRDBです。データはArrow IPCファイルへ永続化し、更新はWALで保護します。
 
+SELECT時は **WAL+mmap方式（Base+Delta）** で動作します。過去データはArrowファイルを8192行バッチで遅延読込みし、未チェックポイントのINSERTのみメモリに保持するため、データ量がメモリ容量を超えても動作します。
+
 ## 必要環境
 
 - Docker / Docker Compose
@@ -63,15 +65,141 @@ DROP TABLE IF EXISTS users;
 
 `CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`、単一列・複合`PRIMARY KEY`をサポートします。主キーはNULL値と重複値を拒否します。`CREATE DATABASE`、外部キー、インデックスは未対応です。
 
+## 対応機能
+
+### DDL
+
+| 機能 | 構文 | 備考 |
+|------|------|------|
+| テーブル作成 | `CREATE TABLE [IF NOT EXISTS] name (col type, ...)` | |
+| テーブル削除 | `DROP TABLE [IF EXISTS] name` | Arrowデータファイルも同時削除 |
+| 主キー（単一） | `col type PRIMARY KEY` | 列定義に_inline指定_ |
+| 主キー（複合） | `PRIMARY KEY (col1, col2)` | テーブル制約として指定 |
+| CHECKPOINT | `CHECKPOINT` | Base+Deltaマージ→Arrowファイル書込み→Deltaクリア |
+
+#### 対応データ型
+
+| SQL型 | エイリアス | 格納型 |
+|-------|-----------|--------|
+| `INTEGER` | `INT` | 32bit符号付き整数 |
+| `BIGINT` | — | 64bit符号付き整数 |
+| `VARCHAR` | `CHAR`, `TEXT` | UTF-8可変長文字列 |
+| `DOUBLE` | `FLOAT`, `REAL` | 64bit浮動小数点 |
+| `BOOLEAN` | `BOOL` | 真偽値 |
+
+### DML
+
+| 機能 | 構文例 | 備考 |
+|------|--------|------|
+| 単一行INSERT | `INSERT INTO t VALUES (1, 'Alice')` | |
+| 複数行INSERT | `INSERT INTO t VALUES (1,'A'), (2,'B')` | 1文で複数VALUES |
+| NULL値 | `INSERT INTO t VALUES (1, NULL)` | 全カラムNULL許容 |
+| DELETE（条件付き） | `DELETE FROM t WHERE age >= 30` | 影響行数を返却 |
+| DELETE（全行） | `DELETE FROM t` | WHERE省略で全件削除 |
+| UPDATE（単一カラム） | `UPDATE t SET age = 31 WHERE id = 1` | |
+| UPDATE（複数カラム） | `UPDATE t SET name = 'Bob', age = 25 WHERE id = 1` | |
+| UPDATE（全行） | `UPDATE t SET age = 0` | WHERE省略で全件更新 |
+| UPDATE（NULL指定） | `UPDATE t SET name = NULL WHERE id = 1` | |
+| UPDATE（カラム参照） | `UPDATE t SET name = other_col WHERE id = 1` | 同行の別カラムをコピー |
+
+### SELECT
+
+| 機能 | 構文例 |
+|------|--------|
+| 全件取得 | `SELECT * FROM users` |
+| カラム指定 | `SELECT name, age FROM users` |
+| WHERE（数値比較） | `WHERE age >= 30` |
+| WHERE（AND） | `WHERE age > 20 AND age < 40` |
+| WHERE（文字列一致） | `WHERE name = 'Alice'` |
+| ORDER BY | `ORDER BY age ASC` / `DESC` |
+| LIMIT | `LIMIT 10` |
+| DISTINCT | `SELECT DISTINCT age FROM users` |
+
+#### 集計関数
+
+| 関数 | 構文例 |
+|------|--------|
+| COUNT | `SELECT COUNT(*) FROM users` |
+| MAX | `SELECT MAX(age) FROM users` |
+| MIN | `SELECT MIN(age) FROM users` |
+| SUM | `SELECT SUM(age) FROM users` |
+| AVG | `SELECT AVG(age) FROM users` |
+| GROUP BY | `SELECT age, COUNT(*) FROM users GROUP BY age` |
+
+#### JOIN
+
+```sql
+-- INNER JOIN
+SELECT u.name, o.product
+FROM users u
+INNER JOIN orders o ON u.id = o.uid
+WHERE o.amount > 100
+ORDER BY o.oid;
+
+-- JOIN + GROUP BY集計
+SELECT u.name, SUM(o.amount) AS total
+FROM users u
+JOIN orders o ON u.id = o.uid
+GROUP BY u.name
+ORDER BY u.name;
+```
+
+### トランザクション
+
+- **AUTOCOMMITのみ対応**。各INSERTは自動的にBEGIN→INSERT→COMMITのWALレコードとして記録される
+- 明示的 `BEGIN` / `COMMIT` / `ROLLBACK` は未対応
+
+### 永続化とリカバリ
+
+| 機能 | 説明 |
+|------|------|
+| WAL（Write-Ahead Logging） | INSERTごとにディスクへ先行書込み。クラッシュ時にデータ消失を防ぐ |
+| CHECKPOINT | 手動（`CHECKPOINT`文）または自動（時間間隔）。Base+DeltaをマージしてArrowファイルに永続化 |
+| 自動チェックポイント | `startCheckpoint(intervalSeconds)` でバックグラウンド定期実行 |
+| クラッシュリカバリ | 再起動時に catalog.json → Arrowファイル(Base) → WAL(Delta) の順で自動復元 |
+
+### ストレージ方式（Base + Delta）
+
+| 項目 | 説明 |
+|------|------|
+| Base | チェックポイント時点のスナップショット。Arrow IPCファイルをmmap遅延読込み（8192行バッチ） |
+| Delta | チェックポイント以降のINSERT行。メモリ上に保持、チェックポイント時にクリア |
+| メモリ効率 | 過去データはOSページキャッシュに任せる。メモリに乗るのはDelta（未フラッシュ分）のみ |
+
+### 接続方式
+
+| 方式 | 接続先 | 備考 |
+|------|--------|------|
+| 組込みJDBC | 同一JVM内 | `ExampleRdb` インスタンスから `getConnection()` |
+| リモートJDBC | `jdbc:avatica:remote:url=http://host:8765` | Avatica HTTP + Protobuf。DBeaver対応 |
+
+### 未対応の機能
+
+- 明示的トランザクション（BEGIN / COMMIT / ROLLBACK）
+- インデックス
+- 外部キー制約
+- CREATE DATABASE / ALTER TABLE
+- UPDATEでの算術式（`SET age = age + 1`）
+- リモート接続の認証・TLS
+- 複数クライアントからの同時書込み排他制御
+
 ## ドキュメント
 
-- [設計書](docs/DESIGN.md)
+- [設計書](docs/DESIGN.md) — アーキテクチャ全体、データフロー、コンポーネント一覧
+- [クエリ経路シーケンス図](docs/SEQUENCE.md) — SELECT/INSERT/DDL/CHECKPOINT/リカバリのMermaidシーケンス図
+- [WAL+mmap方式設計書](docs/WAL_MMAP_DESIGN.md) — Base+Delta方式のメモリ管理、制限事項
 
 ## よく使うコマンド
 
 ```bash
-# 全テスト
+# 全テスト（104件）
 docker compose run --rm rdb-dev mvn test
+
+# UPDATE/DELETEテストのみ
+docker compose run --rm rdb-dev mvn test -Dtest=UpdateDeleteTest
+
+# mmap永続化テストのみ
+docker compose run --rm rdb-dev mvn test -Dtest=MmapPersistenceTest
 
 # Avaticaを含むリモートJDBCテスト
 docker compose run --rm rdb-dev mvn test -Dtest=JdbcQueryClientTest

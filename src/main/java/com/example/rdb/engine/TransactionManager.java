@@ -25,6 +25,17 @@ public class TransactionManager implements ExampleTable.WalAware {
         }
     }
 
+    @Override
+    public void onDelete(String tableName, Map<String, Object> values) {
+        try {
+            int txId = walManager.beginTransaction();
+            walManager.logDelete(txId, tableName, values);
+            walManager.commitTransaction(txId);
+        } catch (IOException e) {
+            throw new RuntimeException("WAL write failed for DELETE on " + tableName, e);
+        }
+    }
+
     public int begin() throws IOException {
         return walManager.beginTransaction();
     }

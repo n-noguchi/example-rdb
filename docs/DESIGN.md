@@ -18,49 +18,47 @@ graph TB
     RemoteClient[リモート JDBC Client<br/>DBeaver / Avatica JDBC]
     Avatica[Avatica HTTP Server<br/>Protobuf]
 
+    subgraph DDL["JdbcDdlSupport (Proxy)"]
+        DdlHandler["DDL / CHECKPOINT<br/>インターセプト"]
+    end
+
     subgraph JDBC["Calcite JDBC Adapter"]
         Parser["SQL Parser<br/>(SQL → SqlNode)"]
         Validator["Validator<br/>(SqlNode → RelNode)"]
         Optimizer["Optimizer<br/>(ルールベース最適化)"]
     end
 
-    subgraph Exec["Query Executor (自作)"]
-        Planner["Physical Plan<br/>(RelNode → Enumerable)"]
-        Scan[Table Scan]
-        Filter[Filter]
-        Project[Project]
+    subgraph Scan["ExampleTable.scan()"]
+        ScanBase["Base: ArrowBatchEnumerable<br/>mmap遅延読込み<br/>(8192行バッチ)"]
+        ScanDelta["Delta: ListEnumerable<br/>未フラッシュ行<br/>(メモリ)"]
+        ScanMerge["MergedEnumerable<br/>Base + Delta 連結"]
     end
 
-    subgraph Storage["Storage Engine (自作)"]
-        ArrowReader["Arrow Storage<br/>Arrow IPC 読込み"]
-        Catalog["Catalog Manager<br/>スキーマ・テーブル定義"]
-    end
-
-    subgraph WAL["WAL Manager (自作)"]
+    subgraph WAL["WAL Manager"]
         WalWriter["WAL Writer<br/>redoログ先行書込み"]
-        Checkpoint["Checkpoint<br/>時間間隔でArrowフラッシュ"]
+        Checkpoint["Checkpoint<br/>時間間隔でBase+Delta統合"]
         Recovery["Recovery<br/>起動時WAL再適用"]
     end
 
+    Catalog["Catalog Manager<br/>スキーマ・テーブル定義"]
     Disk[(ディスク<br/>data/)]
 
-    Client -->|"JDBC (同一JVM)"| Parser
+    Client -->|"JDBC"| DdlHandler
     RemoteClient -->|"HTTP / Avatica"| Avatica
-    Avatica -->|"JDBC"| Parser
+    Avatica -->|"JDBC"| DdlHandler
+    DdlHandler -->|"DML/SELECT"| Parser
+    DdlHandler -->|"DDL/CKPT"| Catalog
     Parser --> Validator
     Validator --> Optimizer
-    Optimizer --> Planner
-    Planner --> Scan
-    Scan --> Filter
-    Filter --> Project
-    Scan --> ArrowReader
-    ArrowReader --> Catalog
-    Planner -->|"INSERT/UPDATE/DELETE"| WalWriter
+    Optimizer -->|"scan()"| ScanMerge
+    ScanMerge --> ScanBase
+    ScanMerge --> ScanDelta
+    ScanBase -->|"loadNextBatch()"| Disk
+    DdlHandler -->|"INSERT"| WalWriter
     WalWriter --> Checkpoint
-    Checkpoint --> ArrowReader
-    WalWriter --> Recovery
-    ArrowReader --> Disk
+    Checkpoint -->|"writeMergedTable"| Disk
     WalWriter --> Disk
+    Catalog --> Disk
 ```
 
 ---
@@ -70,11 +68,13 @@ graph TB
 | コンポーネント | 役割 | 技術 | 実装 |
 |---|---|---|---|
 | Calcite JDBC Adapter | JDBCインターフェース、SQL解析・最適化 | Apache Calcite + Avatica | 既存 |
-| Schema / Table | CalciteのSPI実装、メタデータ提供 | Calcite SPI | 自作 |
-| Query Executor | RelNode → 物理実行、読み取り処理 | Calcite Enumerable | 自作 |
-| Arrow Storage Engine | Arrow IPC形式の読み書き | Apache Arrow Java | 自作 |
+| JdbcDdlSupport | DDL/CHECKPOINT/DELETE/UPDATEをCalcite到達前にインターセプト | Java動的プロキシ | 自作 |
+| Schema / Table | Calcite SPI実装、Base+Deltaスキャン、DELETE/UPDATE/tombstone管理 | Calcite SPI | 自作 |
+| ArrowBatchEnumerable | Arrow IPCファイルを8192行バッチでmmap遅延読込み | Apache Arrow Java | 自作 |
+| MergedEnumerable | Base(Arrow) + Delta(メモリ)のEnumerable連結 | Calcite linq4j | 自作 |
+| Arrow Storage Engine | Arrow IPC形式の読み書き、バッチ書込み、マージ書込み | Apache Arrow Java | 自作 |
 | WAL Manager | 書込みの先行ログ化、チェックポイント、リカバリ | 独自実装 | 自作 |
-| Catalog Manager | テーブル/カラム定義の永続化 | JSON | 自作 |
+| Catalog Manager | テーブル/カラム/主キー定義の永続化 | JSON | 自作 |
 | Transaction Manager | トランザクション管理（AUTOCOMMIT中心） | 独自実装 | 自作 |
 | Avatica HTTP Server | リモートJDBC要求をCalcite JDBCへ中継 | Apache Avatica Jetty | 自作 |
 
@@ -110,92 +110,186 @@ sequenceDiagram
 
 ---
 
-### 4.1 書込みフロー（WAL方式）
+### 4.1 書込みフロー（WAL + Delta方式）
+
+INSERT、DELETE、UPDATEすべてWAL先行書込みで保護される。
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Calcite as Calcite JDBC
-    participant TxMgr as Transaction Manager
+    participant DdlProxy as JdbcDdlSupport
+    participant Calcite as Calcite
+    participant Table as ExampleTable
+    participant TxMgr as TxManager
     participant WAL as WAL Manager
-    participant Mem as Arrow Buffer (メモリ)
-    participant CKPT as Checkpoint
+    participant Delta as Delta Buffer
+    participant Deleted as deletedRows
     participant Disk as Disk
 
-    Client->>Calcite: INSERT INTO t VALUES ...
-    Calcite->>TxMgr: BEGIN (AUTOCOMMIT)
+    Note over Client,DdlProxy: INSERT
+    Client->>DdlProxy: INSERT INTO t VALUES ...
+    DdlProxy->>Calcite: 委譲 → ModifiableTable.add()
+    Table->>TxMgr: onInsert (WAL先行書込み)
+    TxMgr->>WAL: BEGIN → INSERT → COMMIT
+    WAL->>Disk: fsync
+    Table->>Delta: deltaRows.add(row)
 
-    Note over WAL: ★ 先行書込み（fsync）
-    WAL->>Disk: 1. WALレコード追記 [txId, INSERT, table, rows]
-    WAL-->>TxMgr: ACK
+    Note over Client,DdlProxy: DELETE
+    Client->>DdlProxy: DELETE FROM t WHERE ...
+    DdlProxy->>Calcite: SELECT借用で該当行取得
+    Table->>TxMgr: onDelete (各行)
+    TxMgr->>WAL: BEGIN → DELETE → COMMIT
+    Table->>Delta: deltaRowsから削除
+    Table->>Deleted: Base行ならdeletedRowsにtombstone
 
-    Mem->>Mem: 2. Arrow Bufferに適用 (VectorSchemaRoot)
+    Note over Client,DdlProxy: UPDATE
+    Client->>DdlProxy: UPDATE t SET ... WHERE ...
+    DdlProxy->>Calcite: SELECT借用で該当行取得
+    DdlProxy->>DdlProxy: SET式評価で新行生成
+    Table->>TxMgr: onDelete + onInsert (各行)
+    TxMgr->>WAL: DELETE old + INSERT new
+    Table->>Deleted: 古いBase行をtombstone
+    Table->>Delta: 新しい行を追加
 
-    TxMgr->>WAL: 3. COMMIT レコード追記
-    WAL->>Disk: COMMIT [txId]
-
-    Note over CKPT: 一定時間経過後
-    CKPT->>Mem: 4. Arrow Buffer取得
-    CKPT->>Disk: 5. Arrow IPCファイル書込み (atomic rename)
-    CKPT->>Disk: 6. 古いWALセグメント削除
+    Note over DdlProxy: CHECKPOINT時
+    DdlProxy->>DdlProxy: writeMergedTable(Base全行 + Delta)
+    DdlProxy->>Delta: clearDelta()
+    DdlProxy->>Deleted: clear (deletedRowsもクリア)
+    DdlProxy->>Disk: 新Arrowファイル(atomic rename)
+    DdlProxy->>Disk: 古いWALセグメント削除
 ```
 
-### 4.2 読込みフロー
+### 4.2 読込みフロー（Base + Delta マージ）
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Calcite as Calcite JDBC
-    participant Exec as Query Executor
-    participant Storage as Arrow Storage
-    participant WAL as WAL Buffer
+    participant Table as ExampleTable
+    participant Base as ArrowBatchEnumerable<br/>(Base: mmap遅延読込み)
+    participant Delta as ListEnumerable<br/>(Delta: メモリ)
     participant Disk as Disk
 
     Client->>Calcite: SELECT ... FROM t WHERE ...
-    Calcite->>Exec: RelNode (Scan + Filter + Project)
+    Calcite->>Calcite: リレーショナル代数変換<br/>(Scan + Filter + Project)
+    Calcite->>Table: scan(root)
+    Table->>Table: MergedEnumerable(base, delta)
 
-    Exec->>Storage: Arrow IPC読込み
-    Storage->>Disk: ファイル読出し
-    Disk-->>Storage: Arrow RecordBatch
-    Storage-->>Exec: VectorSchemaRoot
+    Note over Base: Base: Arrow IPCファイル遅延読込み
+    Base->>Base: ArrowFileReader.open()
+    Base->>Disk: loadNextBatch()<br/>(最大8192行/バッチ)
+    Disk-->>Base: VectorSchemaRoot
+    Note over Base: アクセスしたページ分のみ<br/>OSページキャッシュに乗る
+    Base->>Base: Object[] 行データ抽出
 
-    Note over Exec,WAL: WAL未フラッシュ分をマージ
-    Exec->>WAL: 未コミット/未フラッシュバッファ参照
-    WAL-->>Exec: 差分行データ
+    Note over Delta: Delta: メモリ上の未フラッシュ行
+    Delta->>Delta: deltaRows 反復
 
-    Exec->>Exec: Filter / Project 適用
-    Exec-->>Calcite: Enumerable<Row>
+    Calcite->>Calcite: Filter / Project 適用
     Calcite-->>Client: ResultSet
 ```
+
+メモリに保持するのは Delta（未フラッシュ分）のみ。過去データは全てmmap経由でOSページキャッシュに任せる。
 
 ### 4.3 リカバリフロー（起動時）
 
 ```mermaid
 sequenceDiagram
-    participant DB as ExampleRDB
-    participant Storage as Arrow Storage
+    participant DB as ExampleRDB<br/>(コンストラクタ)
+    participant Catalog as CatalogManager
+    participant Table as ExampleTable
     participant WAL as WAL Reader
     participant Disk as Disk
 
-    DB->>Storage: 最新Arrowファイル読込み
-    Storage->>Disk: tables/*.arrow
-    Disk-->>Storage: VectorSchemaRoot
+    DB->>Catalog: load()
+    Catalog->>Disk: meta/catalog.json 読込み
+    Catalog-->>DB: List<TableDef>
 
-    DB->>WAL: 未チェックポイントWAL読込み
-    WAL->>Disk: WAL/wal_XXX.log
-    Disk-->>WAL: WALレコード群
+    loop 各テーブル定義
+        DB->>Table: new ExampleTable(name, columns, pk)
+        DB->>Table: setAllocator(storage.allocator)
+        DB->>Table: setBaseDataPath(tables/<name>.arrow)
+        Note over Table: ★ 全件メモリ読込しない<br/>パスを設定するだけ<br/>実際の読込みはSELECT時
 
-    loop 各WALレコード
-        WAL->>Storage: レコード再適用
-        Note over WAL: COMMIT済みのみ適用<br/>未完了Txは破棄
+        DB->>Disk: tables/<name>.arrow 存在確認
+        alt Arrowファイルが存在
+            Note over Table: baseDataPathにパスを設定<br/>遅延読込みで後で参照
+        end
     end
 
-    Note over DB: メモリ上に最新状態が復元完了
+    Note over DB: ★ WAL未フラッシュ分をDeltaに再適用
+    DB->>WAL: readAllSegments()
+    WAL->>Disk: 全WALセグメント読込み
+    WAL-->>DB: List<WalRecord>
+
+    loop 各WALレコード
+        alt operation == INSERT
+            DB->>Table: addRow(row) → deltaRowsに追加
+        end
+    end
+
+    Note over DB: リカバリ完了<br/>Base: ファイルパス参照のみ<br/>Delta: WALリプレイ分
 ```
 
 ---
 
-## 5. WALレコード構成
+## 5. ストレージモデル（Base + Delta）
+
+### メモリ構造
+
+```
+ExampleTable
+├── baseDataPath: Path           ← Arrow IPCファイルのパス（mmap遅延読込み）
+├── deltaRows: List<Object[]>    ← 未チェックポイントのINSERT/UPDATE行
+├── deletedRows: List<Object[]>  ← Baseから削除された行のtombstone
+└── allocator: BufferAllocator   ← Arrowメモリアロケータ（共有）
+```
+
+### SELECT時のスキャン
+
+```
+scan()
+  │
+  ├── ArrowBatchEnumerable(baseDataPath)
+  │     ArrowFileReader.loadNextBatch() で8192行ずつ読込
+  │     FilteredEnumerator が deletedRows に該当する行をスキップ
+  │     アクセスしたページのみOSページキャッシュに乗る
+  │
+  └── ListEnumerable(deltaRows)
+        Delta の行をメモリから返す
+
+→ MergedEnumerable で両者を連結
+```
+
+### Arrow IPCファイルのバッチ構成
+
+```
+┌──────────────────┐
+│ Magic (ARROW1)   │
+│ Schema           │
+├──────────────────┤
+│ RecordBatch 0    │  ← 最大8192行
+│ RecordBatch 1    │  ← 最大8192行
+│ ...              │
+│ RecordBatch N    │
+├──────────────────┤
+│ Footer           │
+│ Magic (ARROW1)   │
+└──────────────────┘
+```
+
+### メモリ使用量
+
+| 要素 | サイズ | 解放タイミング |
+|------|--------|--------------|
+| Base (mmapページ) | アクセスしたページ分のみ | OSがLRUで自動追い出し |
+| Delta (未フラッシュ行) | チェックポイント間隔分のINSERT/UPDATE行 | チェックポイント時にクリア |
+| deletedRows (tombstone) | 削除されたBase行の数 | チェックポイント時にクリア |
+| Arrow Readerオブジェクト | 数KB（テーブル単位） | Enumerator.close() 時 |
+
+---
+
+## 6. WALレコード構成
 
 ```mermaid
 graph LR
@@ -222,31 +316,33 @@ graph LR
 | Payload | 可変長 | 行データ。Arrow IPC RecordBatchシリアライズ |
 | CRC32 | 4 bytes | レコード全体の整合性チェック |
 
+実装ではJSON Lines形式（1行1レコード）を使用し、可読性を確保している。
+
 ---
 
-## 6. チェックポイント方式
+## 7. チェックポイント方式
 
 時間間隔トリガー（デフォルト30秒）で実行。
 
 ```mermaid
 flowchart TD
-    Start([チェックポイント開始]) --> Lock[テーブル書き込みロック取得]
-    Lock --> Snapshot[Arrow Buffer のスナップショット取得]
-    Snapshot --> WriteTemp[一時ファイルにArrow IPC書込み]
-    WriteTemp --> Rename[atomic rename で本ファイル置換]
-    Rename --> WriteMeta[チェックポイントLSNをメタに記録]
-    WriteMeta --> RotateWAL[古いWALセグメントを削除]
-    RotateWAL --> Unlock[ロック解放]
-    Unlock --> Done([完了])
+    Start([チェックポイント開始]) --> Merge["Base(Arrow)全行読込 + Delta行を結合"]
+    Merge --> WriteBatch[8192行バッチで新Arrowファイル書込み]
+    WriteBatch --> Rename[atomic rename で本ファイル置換]
+    Rename --> SetBase[table.setBaseDataPath 新ファイル]
+    SetBase --> ClearDelta[table.clearDelta メモリ解放]
+    ClearDelta --> RotateWAL[古いWALセグメントを削除]
+    RotateWAL --> Done([完了])
 
     style Start fill:#4CAF50,color:#fff
     style Done fill:#4CAF50,color:#fff
     style Rename fill:#FF9800,color:#fff
+    style ClearDelta fill:#2196F3,color:#fff
 ```
 
 ---
 
-## 7. ディスクレイアウト
+## 8. ディスクレイアウト
 
 ```
 data/
@@ -263,55 +359,64 @@ data/
 
 ---
 
-## 8. ディレクトリ構成（プロジェクト）
+## 9. ディレクトリ構成（プロジェクト）
 
 ```
 example-rdb/
 ├── pom.xml
 ├── docs/
-│   └── DESIGN.md
+│   ├── DESIGN.md                         ← 本設計書
+│   ├── SEQUENCE.md                       ← クエリ経路シーケンス図
+│   └── WAL_MMAP_DESIGN.md                ← WAL+mmap方式設計書
 ├── src/main/java/com/example/rdb/
-│   ├── ExampleRdb.java                  ← エントリポイント
+│   ├── ExampleRdb.java                   ← エントリポイント
 │   │
 │   ├── jdbc/
-│   │   ├── ExampleDriver.java           ← JDBCドライバ登録
-│   │   └── ExampleJdbcFactory.java      ← Calcite JDBC Factory
+│   │   └── JdbcDdlSupport.java           ← DDL/CHECKPOINT プロキシ
 │   │
 │   ├── schema/
-│   │   ├── ExampleSchema.java           ← Calcite Schema 実装
-│   │   ├── ExampleTable.java            ← Calcite Table 実装
-│   │   └── CatalogManager.java          ← カタログ管理
+│   │   ├── ExampleSchema.java            ← Calcite Schema 実装
+│   │   ├── ExampleTable.java             ← Calcite Table (Base+Delta スキャン)
+│   │   ├── ListEnumerable.java           ← List → Enumerable 変換
+│   │   ├── MergedEnumerable.java         ← Base+Delta 連結
+│   │   └── CatalogManager.java           ← カタログ管理
 │   │
 │   ├── storage/
-│   │   ├── ArrowStorage.java            ← Arrow IPC 読み書き
-│   │   └── ArrowSchemaConverter.java    ← Arrow ⇔ RelDataType 変換
+│   │   ├── ArrowStorage.java             ← Arrow IPC 読み書き (8192行バッチ)
+│   │   ├── ArrowBatchEnumerable.java     ← mmap遅延読込み Enumerable
+│   │   └── ArrowSchemaConverter.java     ← Arrow ⇔ RelDataType 変換
 │   │
 │   ├── wal/
-│   │   ├── WalManager.java              ← WAL統合管理
-│   │   ├── WalWriter.java               ← WAL書込み
-│   │   ├── WalReader.java               ← WAL読込み
-│   │   ├── WalRecord.java               ← レコード定義
-│   │   └── CheckpointManager.java       ← チェックポイント管理
+│   │   ├── WalManager.java               ← WAL統合管理
+│   │   ├── WalWriter.java                ← WAL書込み
+│   │   ├── WalReader.java                ← WAL読込み
+│   │   ├── WalRecord.java                ← レコード定義
+│   │   ├── WalOperation.java             ← 操作種別
+│   │   └── CheckpointManager.java        ← チェックポイント管理
 │   │
 │   ├── engine/
-│   │   ├── QueryExecutor.java           ← 実行エンジン
-│   │   └── TransactionManager.java      ← トランザクション管理
+│   │   └── TransactionManager.java       ← トランザクション管理
 │   │
-│   └── util/
-│       └── FileUtils.java
+│   └── remote/
+│       ├── ExampleAvaticaServer.java     ← Avatica HTTP サーバー
+│       └── ExampleJdbcMeta.java          ← Avatica メタデータアダプタ
 │
-├── src/test/java/com/example/rdb/
-│   ├── jdbc/
-│   ├── storage/
-│   ├── wal/
-│   └── engine/
+├── src/test/java/com/example/rdb/        ← テスト
+│   ├── support/                          ← 組込みクライアントテスト
+│   ├── testclient/                       ← JDBCクライアントテスト
+│   ├── storage/                          ← Arrowストレージテスト
+│   ├── wal/                              ← WALテスト
+│   ├── remote/                           ← リモートサーバーテスト
+│   ├── MmapPersistenceTest.java          ← mmap永続化テスト
+│   ├── PersistenceRecoveryTest.java      ← 永続化・リカバリテスト
+│   └── ...
 │
-└── data/                                ← 実行時に生成（gitignore対象）
+└── data/                                 ← 実行時に生成（gitignore対象）
 ```
 
 ---
 
-## 9. 技術スタック
+## 10. 技術スタック
 
 | 項目 | 選択 | バージョン(目安) |
 |---|---|---|
@@ -324,7 +429,7 @@ example-rdb/
 
 ---
 
-## 10. トランザクション設計
+## 11. トランザクション設計
 
 現段階では **AUTOCOMMIT中心**。将来的な明示的トランザクション拡張も見据えた設計。
 
@@ -334,7 +439,7 @@ state diagram-v2
 
     Idle --> Active: SQL受信 (AUTOCOMMIT)
     Active --> Writing: WAL先行書込み
-    Writing --> Applying: Arrow Buffer適用
+    Writing --> Applying: Delta Buffer に追加
     Applying --> Committing: COMMIT
     Committing --> Flushed: COMMIT レコード追記
     Flushed --> Idle: レスポンス返却
@@ -347,7 +452,7 @@ state diagram-v2
 
 ---
 
-## 11. 実装フェーズ
+## 12. 実装フェーズ
 
 ```mermaid
 graph LR
@@ -355,18 +460,24 @@ graph LR
     P2["Phase 2<br/>WAL書込み<br/>WAL Manager + Tx"]
     P3["Phase 3<br/>Arrow永続化<br/>ArrowStorage + Checkpoint"]
     P4["Phase 4<br/>リカバリ<br/>起動時WAL再適用"]
+    P5["Phase 5<br/>mmap方式<br/>Base+Delta遅延読込み"]
+    P6["Phase 6<br/>UPDATE/DELETE<br/>tombstone + WAL対応"]
 
-    P1 --> P2 --> P3 --> P4
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6
 
     style P1 fill:#2196F3,color:#fff
     style P2 fill:#4CAF50,color:#fff
     style P3 fill:#FF9800,color:#fff
     style P4 fill:#9C27B0,color:#fff
+    style P5 fill:#F44336,color:#fff
+    style P6 fill:#795548,color:#fff
 ```
 
 | Phase | 内容 | 完了条件 |
 |---|---|---|
 | **1** | Calcite接続、Schema/Table実装、インメモリでSELECT | JDBC経由でSELECTが実行できる |
-| **2** | WAL Manager実装、INSERT/UPDATE/DELETEのWAL書込み | データ更新がWALに記録される |
+| **2** | WAL Manager実装、INSERTのWAL書込み | データ更新がWALに記録される |
 | **3** | Arrow Storage + Checkpoint実装 | データがArrow IPCファイルに永続化される |
 | **4** | リカバリ実装 | 再起動後にデータが復元される |
+| **5** | mmap方式移行（Base+Delta） | 全データをメモリに保持せず、Arrowファイル遅延読込みで動作 |
+| **6** | UPDATE/DELETE対応 | DELETE（tombstone方式）、UPDATE（DELETE+INSERT）、WAL/リカバリ対応 |

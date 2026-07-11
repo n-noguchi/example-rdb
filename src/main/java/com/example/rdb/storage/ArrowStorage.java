@@ -14,7 +14,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.ArrowFileWriter;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
-import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.sql.type.SqlTypeName;
 
@@ -30,6 +29,8 @@ import java.util.List;
 
 public class ArrowStorage {
 
+    static final int BATCH_SIZE = 8192;
+
     private final BufferAllocator allocator;
 
     public ArrowStorage() {
@@ -41,8 +42,27 @@ public class ArrowStorage {
     }
 
     public void writeTable(Path filePath, ExampleTable table) throws IOException {
+        writeRowsBatched(filePath, table.getRows(), table.getColumns());
+    }
+
+    public void writeRows(Path filePath, List<Object[]> rows, List<ExampleTable.ColumnDef> columns) throws IOException {
+        writeRowsBatched(filePath, rows, columns);
+    }
+
+    public void writeMergedTable(Path filePath, Path basePath, List<Object[]> deltaRows,
+                                 List<ExampleTable.ColumnDef> columns) throws IOException {
+        List<Object[]> allRows = new ArrayList<>();
+        if (basePath != null && Files.exists(basePath)) {
+            allRows.addAll(readTable(basePath, columns));
+        }
+        allRows.addAll(deltaRows);
+        writeRowsBatched(filePath, allRows, columns);
+    }
+
+    private void writeRowsBatched(Path filePath, List<Object[]> rows,
+                                  List<ExampleTable.ColumnDef> columns) throws IOException {
         Files.createDirectories(filePath.getParent());
-        Schema schema = ArrowSchemaConverter.toArrowSchema(table.getColumns());
+        Schema schema = ArrowSchemaConverter.toArrowSchema(columns);
         Path tmpPath = filePath.resolveSibling(filePath.getFileName() + ".tmp");
 
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
@@ -50,11 +70,25 @@ public class ArrowStorage {
              ArrowFileWriter writer = new ArrowFileWriter(root, null, fos.getChannel())) {
 
             writer.start();
-            List<Object[]> rows = table.getRows();
 
-            populateVectors(root, table.getColumns(), rows);
-            root.setRowCount(rows.size());
-            writer.writeBatch();
+            if (rows.isEmpty()) {
+                root.allocateNew();
+                for (FieldVector v : root.getFieldVectors()) {
+                    v.setValueCount(0);
+                }
+                root.setRowCount(0);
+                writer.writeBatch();
+            } else {
+                for (int start = 0; start < rows.size(); start += BATCH_SIZE) {
+                    int end = Math.min(start + BATCH_SIZE, rows.size());
+                    List<Object[]> batch = rows.subList(start, end);
+                    root.clear();
+                    populateVectors(root, columns, batch);
+                    root.setRowCount(batch.size());
+                    writer.writeBatch();
+                }
+            }
+
             writer.end();
         }
 
@@ -71,16 +105,31 @@ public class ArrowStorage {
              SeekableReadChannel channel = new SeekableReadChannel(fis.getChannel());
              ArrowFileReader reader = new ArrowFileReader(channel, allocator)) {
 
-            reader.loadNextBatch();
-            VectorSchemaRoot root = reader.getVectorSchemaRoot();
-            extractRows(root, columns, rows);
-
-            while (reader.loadNextBatch()) {
+            if (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
                 extractRows(root, columns, rows);
+                while (reader.loadNextBatch()) {
+                    extractRows(root, columns, rows);
+                }
             }
         }
 
         return rows;
+    }
+
+    public long countRows(Path filePath) throws IOException {
+        if (!Files.exists(filePath)) {
+            return 0;
+        }
+        long count = 0;
+        try (FileInputStream fis = new FileInputStream(filePath.toFile());
+             SeekableReadChannel channel = new SeekableReadChannel(fis.getChannel());
+             ArrowFileReader reader = new ArrowFileReader(channel, allocator)) {
+            while (reader.loadNextBatch()) {
+                count += reader.getVectorSchemaRoot().getRowCount();
+            }
+        }
+        return count;
     }
 
     private void populateVectors(VectorSchemaRoot root, List<ExampleTable.ColumnDef> columns, List<Object[]> rows) {

@@ -1,11 +1,13 @@
 package com.example.rdb.schema;
 
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.calcite.DataContext;
+import org.apache.calcite.linq4j.AbstractEnumerable;
 import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
 import org.apache.calcite.linq4j.QueryProvider;
 import org.apache.calcite.linq4j.Queryable;
 import org.apache.calcite.linq4j.tree.Expression;
-import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.prepare.Prepare;
@@ -23,8 +25,10 @@ import org.apache.calcite.schema.impl.AbstractTable;
 import org.apache.calcite.sql.type.SqlTypeName;
 
 import java.lang.reflect.Type;
+import java.nio.file.Path;
 import java.util.AbstractCollection;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -37,7 +41,10 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
     private final String tableName;
     private final List<ColumnDef> columns;
     private final List<String> primaryKeyColumns;
-    private final List<Object[]> rows;
+    private final List<Object[]> deltaRows;
+    private final List<Object[]> deletedRows;
+    private Path baseDataPath;
+    private BufferAllocator allocator;
     private WalAware walAware;
 
     public ExampleTable(String tableName, List<ColumnDef> columns) {
@@ -48,16 +55,30 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         this.tableName = tableName;
         this.columns = List.copyOf(columns);
         this.primaryKeyColumns = List.copyOf(primaryKeyColumns);
-        this.rows = new ArrayList<>();
+        this.deltaRows = new ArrayList<>();
+        this.deletedRows = new ArrayList<>();
         validatePrimaryKeyColumns();
     }
 
     public interface WalAware {
         void onInsert(String tableName, Map<String, Object> values);
+        void onDelete(String tableName, Map<String, Object> values);
     }
 
     public void setWalAware(WalAware walAware) {
         this.walAware = walAware;
+    }
+
+    public void setBaseDataPath(Path baseDataPath) {
+        this.baseDataPath = baseDataPath;
+    }
+
+    public Path getBaseDataPath() {
+        return baseDataPath;
+    }
+
+    public void setAllocator(BufferAllocator allocator) {
+        this.allocator = allocator;
     }
 
     public static class ColumnDef {
@@ -82,7 +103,59 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
 
     @Override
     public Enumerable<Object[]> scan(DataContext root) {
-        return new ListEnumerable<>(rows);
+        Enumerable<Object[]> delta = new ListEnumerable<>(deltaRows);
+
+        if (baseDataPath == null || allocator == null) {
+            return delta;
+        }
+
+        Enumerable<Object[]> base = new ArrowBaseEnumerable();
+        return new MergedEnumerable(base, delta);
+    }
+
+    private class ArrowBaseEnumerable extends AbstractEnumerable<Object[]> {
+        @Override
+        public Enumerator<Object[]> enumerator() {
+            Enumerator<Object[]> raw = new com.example.rdb.storage.ArrowBatchEnumerable(
+                    baseDataPath, columns, allocator).enumerator();
+            if (deletedRows.isEmpty()) {
+                return raw;
+            }
+            return new FilteredEnumerator(raw);
+        }
+    }
+
+    private class FilteredEnumerator implements Enumerator<Object[]> {
+        private final Enumerator<Object[]> delegate;
+
+        FilteredEnumerator(Enumerator<Object[]> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Object[] current() {
+            return delegate.current();
+        }
+
+        @Override
+        public boolean moveNext() {
+            while (delegate.moveNext()) {
+                if (!isDeleted(delegate.current())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public void reset() {
+            delegate.reset();
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
+        }
     }
 
     @Override
@@ -124,19 +197,89 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
 
     public synchronized void addRow(Object[] values) {
         validatePrimaryKey(values);
-        rows.add(values);
+        deltaRows.add(values);
     }
 
-    public void deleteRow(int index) {
-        rows.remove(index);
+    public synchronized void deleteRows(List<Object[]> rows) {
+        for (Object[] row : rows) {
+            removeRowInternal(row);
+            if (walAware != null) {
+                walAware.onDelete(tableName, toValueMap(row));
+            }
+        }
     }
 
-    public void updateRow(int index, Object[] values) {
-        rows.set(index, values);
+    public synchronized void deleteRow(Object[] row) {
+        removeRowInternal(row);
+    }
+
+    private void removeRowInternal(Object[] row) {
+        for (int i = deltaRows.size() - 1; i >= 0; i--) {
+            if (rowsEqual(deltaRows.get(i), row)) {
+                deltaRows.remove(i);
+                return;
+            }
+        }
+        deletedRows.add(row);
+    }
+
+    public synchronized void applyUpdates(List<Object[]> oldRows, List<Object[]> newRows) {
+        for (int i = 0; i < oldRows.size(); i++) {
+            Object[] oldRow = oldRows.get(i);
+            Object[] newRow = newRows.get(i);
+
+            removeRowInternal(oldRow);
+            validatePrimaryKey(newRow);
+            deltaRows.add(newRow);
+
+            if (walAware != null) {
+                walAware.onDelete(tableName, toValueMap(oldRow));
+                walAware.onInsert(tableName, toValueMap(newRow));
+            }
+        }
+    }
+
+    private boolean isDeleted(Object[] row) {
+        for (Object[] deleted : deletedRows) {
+            if (rowsEqual(deleted, row)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean rowsEqual(Object[] a, Object[] b) {
+        if (a.length != b.length) return false;
+        for (int i = 0; i < a.length; i++) {
+            if (!valueEquals(a[i], b[i])) return false;
+        }
+        return true;
+    }
+
+    private boolean valueEquals(Object a, Object b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        if (a instanceof Number && b instanceof Number) {
+            return ((Number) a).doubleValue() == ((Number) b).doubleValue();
+        }
+        return a.equals(b);
+    }
+
+    public void clearDelta() {
+        deltaRows.clear();
+        deletedRows.clear();
+    }
+
+    public List<Object[]> getDeltaRows() {
+        return deltaRows;
+    }
+
+    public List<Object[]> getDeletedRows() {
+        return deletedRows;
     }
 
     public List<Object[]> getRows() {
-        return rows;
+        return deltaRows;
     }
 
     public String getTableName() {
@@ -159,12 +302,16 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         return names;
     }
 
-    private Map<String, Object> toMap(Object[] row) {
+    public Map<String, Object> toValueMap(Object[] row) {
         Map<String, Object> map = new LinkedHashMap<>();
         for (int i = 0; i < columns.size() && i < row.length; i++) {
             map.put(columns.get(i).name, row[i]);
         }
         return map;
+    }
+
+    private Map<String, Object> toMap(Object[] row) {
+        return toValueMap(row);
     }
 
     @SuppressWarnings("rawtypes")
@@ -177,15 +324,15 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
             if (walAware != null) {
                 walAware.onInsert(tableName, toMap(row));
             }
-            return rows.add(row);
+            return deltaRows.add(row);
         }
 
         @Override
         public boolean remove(Object o) {
             Object[] target = ensureArray(o);
-            for (int i = 0; i < rows.size(); i++) {
-                if (java.util.Arrays.equals(rows.get(i), target)) {
-                    rows.remove(i);
+            for (int i = 0; i < deltaRows.size(); i++) {
+                if (java.util.Arrays.equals(deltaRows.get(i), target)) {
+                    deltaRows.remove(i);
                     return true;
                 }
             }
@@ -194,12 +341,12 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
 
         @Override
         public Iterator iterator() {
-            return rows.iterator();
+            return deltaRows.iterator();
         }
 
         @Override
         public int size() {
-            return rows.size();
+            return deltaRows.size();
         }
 
         private Object[] ensureArray(Object e) {
@@ -226,7 +373,7 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
                 throw new IllegalArgumentException("Primary key column must not be null: " + columns.get(index).name);
             }
         }
-        for (Object[] existing : rows) {
+        for (Object[] existing : deltaRows) {
             boolean duplicate = indexes.stream().allMatch(index -> Objects.equals(existing[index], values[index]));
             if (duplicate) {
                 throw new IllegalArgumentException("Duplicate primary key for table " + tableName);
@@ -234,7 +381,7 @@ public class ExampleTable extends AbstractTable implements ScannableTable, Modif
         }
     }
 
-    private int columnIndex(String columnName) {
+    public int columnIndex(String columnName) {
         for (int i = 0; i < columns.size(); i++) {
             if (columns.get(i).name.equalsIgnoreCase(columnName)) return i;
         }

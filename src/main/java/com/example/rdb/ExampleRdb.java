@@ -78,37 +78,44 @@ public class ExampleRdb {
                     .map(c -> new ExampleTable.ColumnDef(c.name, c.typeName))
                     .toList();
             ExampleTable table = new ExampleTable(def.name, columns, def.primaryKeyColumns);
-            if (transactionManager != null) {
-                table.setWalAware(transactionManager);
-            }
+            configureTable(table);
             schema.addTable(table);
 
             Path arrowFile = dataDir.resolve("tables").resolve(def.name + ".arrow");
             if (Files.exists(arrowFile)) {
-                List<Object[]> rows = storage.readTable(arrowFile, table.getColumns());
-                for (Object[] row : rows) {
-                    table.addRow(row);
-                }
+                table.setBaseDataPath(arrowFile);
             }
         }
 
         applyWalRecords();
     }
 
+    private void configureTable(ExampleTable table) {
+        if (transactionManager != null) {
+            table.setWalAware(transactionManager);
+        }
+        if (storage != null) {
+            table.setAllocator(storage.getAllocator());
+        }
+    }
+
     private void applyWalRecords() throws IOException {
         List<WalRecord> records = walManager.readAllSegments();
         for (WalRecord record : records) {
+            ExampleTable table = schema.getExampleTable(record.getTableName());
+            if (table == null || record.getValues() == null) continue;
+
+            Object[] row = new Object[table.getColumns().size()];
+            for (int i = 0; i < table.getColumns().size(); i++) {
+                String colName = table.getColumns().get(i).name;
+                Object value = record.getValues().get(colName);
+                row[i] = normalizeValue(value, table.getColumns().get(i).typeName);
+            }
+
             if (record.getOperation() == WalOperation.INSERT) {
-                ExampleTable table = schema.getExampleTable(record.getTableName());
-                if (table != null && record.getValues() != null) {
-                    Object[] row = new Object[table.getColumns().size()];
-                    for (int i = 0; i < table.getColumns().size(); i++) {
-                        String colName = table.getColumns().get(i).name;
-                        Object value = record.getValues().get(colName);
-                        row[i] = normalizeValue(value, table.getColumns().get(i).typeName);
-                    }
-                    table.addRow(row);
-                }
+                table.addRow(row);
+            } else if (record.getOperation() == WalOperation.DELETE) {
+                table.deleteRow(row);
             }
         }
     }
@@ -132,14 +139,11 @@ public class ExampleRdb {
 
     public void createTable(String tableName, List<ExampleTable.ColumnDef> columns, List<String> primaryKeyColumns) {
         ExampleTable table = new ExampleTable(tableName, columns, primaryKeyColumns);
-        if (transactionManager != null) {
-            table.setWalAware(transactionManager);
-        }
+        configureTable(table);
         schema.addTable(table);
         persistCatalog();
     }
 
-    /** Removes a table definition and its checkpointed Arrow data, if present. */
     public boolean dropTable(String tableName) {
         ExampleTable table = schema.getExampleTable(tableName);
         if (table == null) return false;
@@ -205,8 +209,12 @@ public class ExampleRdb {
         } else if (storage != null && dataDir != null) {
             Path tablesDir = dataDir.resolve("tables");
             for (Map.Entry<String, ExampleTable> entry : schema.getTables().entrySet()) {
+                ExampleTable table = entry.getValue();
                 Path arrowFile = tablesDir.resolve(entry.getKey() + ".arrow");
-                storage.writeTable(arrowFile, entry.getValue());
+                storage.writeMergedTable(arrowFile, table.getBaseDataPath(),
+                        table.getDeltaRows(), table.getColumns());
+                table.setBaseDataPath(arrowFile);
+                table.clearDelta();
             }
             walManager.rotateSegment();
             walManager.deleteOldSegments(walManager.getCurrentSegment());

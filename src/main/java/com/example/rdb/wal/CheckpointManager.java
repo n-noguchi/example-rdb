@@ -59,7 +59,10 @@ public class CheckpointManager {
             String tableName = entry.getKey();
             ExampleTable table = entry.getValue();
             Path arrowFile = tablesDir.resolve(tableName + ".arrow");
-            storage.writeTable(arrowFile, table);
+            storage.writeMergedTable(arrowFile, table.getBaseDataPath(),
+                    table.getDeltaRows(), table.getColumns());
+            table.setBaseDataPath(arrowFile);
+            table.clearDelta();
         }
         walManager.rotateSegment();
         walManager.deleteOldSegments(walManager.getCurrentSegment());
