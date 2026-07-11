@@ -1,0 +1,29 @@
+services:
+  rdb-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: example-rdb-dev
+    volumes:
+      # ソースコード
+      - .:/app
+      # Mavenキャッシュを永続化（ビルド高速化）
+      - maven-cache:/root/.m2
+    working_dir: /app
+    tty: true
+    stdin_open: true
+
+  rdb-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: mvn -q compile exec:java -Dexec.mainClass=com.example.rdb.remote.ExampleAvaticaServer -Dexec.args="--data-dir /app/data --port 8765"
+    ports:
+      - "8765:8765"
+    volumes:
+      - .:/app
+      - maven-cache:/root/.m2
+    working_dir: /app
+
+volumes:
+  maven-cache:

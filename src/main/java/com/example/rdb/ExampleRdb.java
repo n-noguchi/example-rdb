@@ -1,0 +1,243 @@
+package com.example.rdb;
+
+import com.example.rdb.engine.TransactionManager;
+import com.example.rdb.jdbc.JdbcDdlSupport;
+import com.example.rdb.schema.CatalogManager;
+import com.example.rdb.schema.ExampleSchema;
+import com.example.rdb.schema.ExampleTable;
+import com.example.rdb.storage.ArrowStorage;
+import com.example.rdb.wal.CheckpointManager;
+import com.example.rdb.wal.WalManager;
+import com.example.rdb.wal.WalOperation;
+import com.example.rdb.wal.WalRecord;
+import org.apache.calcite.jdbc.CalciteConnection;
+import org.apache.calcite.schema.SchemaPlus;
+import org.apache.calcite.sql.type.SqlTypeName;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+
+public class ExampleRdb {
+
+    private final Path dataDir;
+    private final ExampleSchema schema;
+    private final WalManager walManager;
+    private final TransactionManager transactionManager;
+    private final ArrowStorage storage;
+    private final CatalogManager catalogManager;
+    private CheckpointManager checkpointManager;
+
+    public ExampleRdb() {
+        this(null);
+    }
+
+    public ExampleRdb(Path dataDir) {
+        this.dataDir = dataDir;
+        this.schema = new ExampleSchema();
+
+        if (dataDir != null) {
+            try {
+                Files.createDirectories(dataDir);
+                Path walDir = dataDir.resolve("wal");
+                Path tablesDir = dataDir.resolve("tables");
+                Path metaDir = dataDir.resolve("meta");
+                Files.createDirectories(tablesDir);
+                Files.createDirectories(metaDir);
+
+                this.walManager = new WalManager(walDir);
+                this.transactionManager = new TransactionManager(walManager);
+                this.storage = new ArrowStorage();
+                this.catalogManager = new CatalogManager(metaDir.resolve("catalog.json"));
+
+                recover();
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to initialize storage", e);
+            }
+        } else {
+            this.walManager = null;
+            this.transactionManager = null;
+            this.storage = null;
+            this.catalogManager = null;
+        }
+    }
+
+    private void recover() throws IOException {
+        if (catalogManager == null) return;
+
+        List<CatalogManager.TableDef> tableDefs = catalogManager.load();
+        for (CatalogManager.TableDef def : tableDefs) {
+            List<ExampleTable.ColumnDef> columns = def.columns.stream()
+                    .map(c -> new ExampleTable.ColumnDef(c.name, c.typeName))
+                    .toList();
+            ExampleTable table = new ExampleTable(def.name, columns, def.primaryKeyColumns);
+            if (transactionManager != null) {
+                table.setWalAware(transactionManager);
+            }
+            schema.addTable(table);
+
+            Path arrowFile = dataDir.resolve("tables").resolve(def.name + ".arrow");
+            if (Files.exists(arrowFile)) {
+                List<Object[]> rows = storage.readTable(arrowFile, table.getColumns());
+                for (Object[] row : rows) {
+                    table.addRow(row);
+                }
+            }
+        }
+
+        applyWalRecords();
+    }
+
+    private void applyWalRecords() throws IOException {
+        List<WalRecord> records = walManager.readAllSegments();
+        for (WalRecord record : records) {
+            if (record.getOperation() == WalOperation.INSERT) {
+                ExampleTable table = schema.getExampleTable(record.getTableName());
+                if (table != null && record.getValues() != null) {
+                    Object[] row = new Object[table.getColumns().size()];
+                    for (int i = 0; i < table.getColumns().size(); i++) {
+                        String colName = table.getColumns().get(i).name;
+                        Object value = record.getValues().get(colName);
+                        row[i] = normalizeValue(value, table.getColumns().get(i).typeName);
+                    }
+                    table.addRow(row);
+                }
+            }
+        }
+    }
+
+    private Object normalizeValue(Object value, SqlTypeName typeName) {
+        if (value == null) return null;
+        if (value instanceof Number num) {
+            switch (typeName) {
+                case INTEGER -> { return num.intValue(); }
+                case BIGINT -> { return num.longValue(); }
+                case FLOAT -> { return num.floatValue(); }
+                case DOUBLE -> { return num.doubleValue(); }
+            }
+        }
+        return value;
+    }
+
+    public void createTable(String tableName, ExampleTable.ColumnDef... columns) {
+        createTable(tableName, Arrays.asList(columns), List.of());
+    }
+
+    public void createTable(String tableName, List<ExampleTable.ColumnDef> columns, List<String> primaryKeyColumns) {
+        ExampleTable table = new ExampleTable(tableName, columns, primaryKeyColumns);
+        if (transactionManager != null) {
+            table.setWalAware(transactionManager);
+        }
+        schema.addTable(table);
+        persistCatalog();
+    }
+
+    /** Removes a table definition and its checkpointed Arrow data, if present. */
+    public boolean dropTable(String tableName) {
+        ExampleTable table = schema.getExampleTable(tableName);
+        if (table == null) return false;
+
+        try {
+            if (dataDir != null) {
+                Files.deleteIfExists(dataDir.resolve("tables").resolve(tableName + ".arrow"));
+            }
+            schema.removeTable(tableName);
+            persistCatalog();
+            return true;
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to remove table data for " + tableName, e);
+        }
+    }
+
+    private void persistCatalog() {
+        if (catalogManager != null) {
+            try {
+                catalogManager.save(schema.getTables().values());
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to persist catalog", e);
+            }
+        }
+    }
+
+    public void attachWalAware(ExampleTable table) {
+        if (transactionManager != null) {
+            table.setWalAware(transactionManager);
+        }
+    }
+
+    public void insert(String tableName, Object... values) {
+        ExampleTable table = schema.getExampleTable(tableName);
+        if (table == null) {
+            throw new IllegalArgumentException("Table not found: " + tableName);
+        }
+        table.addRow(values);
+    }
+
+    public Connection getConnection() throws SQLException {
+        Properties info = new Properties();
+        info.setProperty("lex", "MYSQL");
+        Connection connection = DriverManager.getConnection("jdbc:calcite:", info);
+        CalciteConnection calciteConnection = connection.unwrap(CalciteConnection.class);
+        SchemaPlus rootSchema = calciteConnection.getRootSchema();
+        rootSchema.add("rdb", schema);
+        calciteConnection.setSchema("rdb");
+        return JdbcDdlSupport.wrap(connection, this);
+    }
+
+    public void startCheckpoint(long intervalSeconds) {
+        if (storage != null && walManager != null && dataDir != null) {
+            checkpointManager = new CheckpointManager(
+                    storage, schema, walManager, dataDir.resolve("tables"), intervalSeconds);
+            checkpointManager.start();
+        }
+    }
+
+    public void checkpoint() throws IOException {
+        if (checkpointManager != null) {
+            checkpointManager.checkpoint();
+        } else if (storage != null && dataDir != null) {
+            Path tablesDir = dataDir.resolve("tables");
+            for (Map.Entry<String, ExampleTable> entry : schema.getTables().entrySet()) {
+                Path arrowFile = tablesDir.resolve(entry.getKey() + ".arrow");
+                storage.writeTable(arrowFile, entry.getValue());
+            }
+            walManager.rotateSegment();
+            walManager.deleteOldSegments(walManager.getCurrentSegment());
+        }
+    }
+
+    public ExampleSchema getSchema() {
+        return schema;
+    }
+
+    public WalManager getWalManager() {
+        return walManager;
+    }
+
+    public TransactionManager getTransactionManager() {
+        return transactionManager;
+    }
+
+    public ArrowStorage getStorage() {
+        return storage;
+    }
+
+    public void close() throws IOException {
+        if (checkpointManager != null) {
+            checkpointManager.stop();
+        }
+        if (walManager != null) {
+            walManager.close();
+        }
+        if (storage != null) {
+            storage.close();
+        }
+    }
+}
