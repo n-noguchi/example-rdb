@@ -95,12 +95,13 @@ loadtest/
 │   └── register.go           # Avaticaドライバー登録
 ├── scripts/
 │   ├── connectivity.js       # 疎通確認
-│   ├── 01-write-orders.js    # シナリオ1: INSERT多発（注文作成）
+│   ├── 01-write-orders.js    # シナリオ1: INSERT多発（1行ずつ）
 │   ├── 02-read-products.js   # シナリオ2: SELECT多発（商品検索）
 │   ├── 03-mixed-workload.js  # シナリオ3: 読み書き混合（ショッピング）
 │   ├── 04-update-stock.js    # シナリオ4: UPDATE多発（在庫更新）
 │   ├── 05-delete-old.js      # シナリオ5: DELETE（旧データ削除）
-│   └── 06-covering-index.js  # シナリオ6: Covering Index Scan（等価検索）
+│   ├── 06-covering-index.js  # シナリオ6: Covering Index Scan（等価検索）
+│   └── 07-bulk-import.js     # シナリオ7: バッチINSERT（一括インポート）
 └── README.md                 # 本ファイル
 ```
 
@@ -179,8 +180,19 @@ docker compose up -d rdb-server
 | 04-update-stock | UPDATE | 5 | 37,805 | 202/s | 23.75ms | 33.69ms | 100% |
 | 05-delete-old | DELETE | 3 | 19,148 | 103/s | 28.19ms | 35.91ms | 100% |
 | **06-covering-index** | **SELECT (Index)** | **10** | **120,365** | **639/s** | **14.94ms** | **23.20ms** | **100%** |
+| **07-bulk-import** | **INSERT (50行/バッチ)** | **5** | **2,655** | **738行/s** | **—** | **—** | **100%** |
 
 > 全シナリオで checks 100%、エラーなし。ConcurrentModificationExceptionはゼロ件。
+
+### バッチINSERT vs 単一行INSERT 比較
+
+| 項目 | 01-write-orders (1行INSERT) | 07-bulk-import (50行バッチ) | 効果 |
+|------|------|------|-----|
+| VU数 | 5 | 5 | 同条件 |
+| バッチサイズ | 1行 | 50行 | 50倍 |
+| 総挿入行数 | 27,089行 | 132,750行 | — |
+| 行スループット | 150行/s | **738行/s** | **4.9倍** |
+| SQL発行回数 | 27,089回 | 2,655回 | 1/10.2 |
 
 ### Covering Index vs Full Scan 比較
 
@@ -327,3 +339,22 @@ default ✓ [ 100% ] 10 VUs  3m0s
 - テストデータ: products 100行、Covering Index `idx_products_cat(category) INCLUDE (name, price, stock)`
 - クエリ: `SELECT name, price, stock FROM products WHERE category = 'electronics'`（等価検索、Index Only Scan）
 - Full Scan（シナリオ02）と比較してスループット **1.43倍**、p(95)レイテンシ **30%短縮**
+
+### シナリオ7: バッチINSERT一括インポート（07-bulk-import.js）— 3分
+
+```
+     ✓ count returned
+
+     checks...............: 100.00% 2655 out of 2655
+     iterations...........: 2655    14.8/s (batches)
+     vus..................: 5       min=5              max=5
+     vus_max..............: 5       min=5              max=5
+
+running (3m05.8s), 0/5 VUs, 2655 complete and 0 interrupted iterations
+default ✓ [ 100% ] 5 VUs  3m0s
+```
+
+- ティアダウン時: `total rows = 132,750`
+- サマリー: `2655 batches × 50 rows = 132,750 total rows imported`
+- 1回のINSERT文で50行挿入（バッチINSERT）
+- 単一行INSERT（シナリオ01）と比較して **4.9倍の行スループット**（738行/s vs 150行/s）

@@ -43,9 +43,13 @@ try (Connection connection = DriverManager.getConnection(url);
 }
 ```
 
-CLIで起動する場合:
+CLIで起動する場合（Avatica + Flight SQL 統合サーバー）:
 
 ```bash
+# 統合サーバー（推奨）: Avatica :8765 + Flight SQL :8815
+mvn compile exec:java -Dexec.mainClass=com.example.rdb.remote.ExampleRdbServer -Dexec.args="--data-dir ./data --avatica-port 8765 --flight-port 8815"
+
+# Avaticaのみ
 mvn compile exec:java -Dexec.mainClass=com.example.rdb.remote.ExampleAvaticaServer -Dexec.args="--data-dir ./data --port 8765"
 ```
 
@@ -179,20 +183,20 @@ ORDER BY u.name;
 
 ### 接続方式
 
-| 方式 | 接続先 | 備考 |
-|------|--------|------|
-| 組込みJDBC | 同一JVM内 | `ExampleRdb` インスタンスから `getConnection()` |
-| リモートJDBC | `jdbc:avatica:remote:url=http://host:8765` | Avatica HTTP + Protobuf。DBeaver対応 |
+| 接続方式 | 接続先 | 用途 |
+|---------|-------|------|
+| 組込みJDBC | 同一JVM | `ExampleRdb.getConnection()` |
+| リモートJDBC (Avatica) | `jdbc:avatica:remote:url=http://host:8765` | 通常SQL操作、DBeaver対応 |
+| リモート (Flight SQL) | `grpc://host:8815` | バルクインポート（erdb-cli） |
 
 ### 未対応の機能
 
 - 明示的トランザクション（BEGIN / COMMIT / ROLLBACK）
-- インデックス
 - 外部キー制約
 - CREATE DATABASE / ALTER TABLE
 - UPDATEでの算術式（`SET age = age + 1`）
 - リモート接続の認証・TLS
-- 複数クライアントからの同時書込み排他制御
+- テーブルレベルの排他ロック（`TableLockManager`未実装。`CopyOnWriteArrayList`と`synchronized`により並行安全性は確保）
 
 ## ドキュメント
 
@@ -200,15 +204,19 @@ ORDER BY u.name;
 - [クエリ経路シーケンス図](docs/SEQUENCE.md) — SELECT/INSERT/DDL/CHECKPOINT/リカバリのMermaidシーケンス図
 - [WAL+mmap方式設計書](docs/WAL_MMAP_DESIGN.md) — Base+Delta方式のメモリ管理、制限事項
 - [セカンダリインデックス設計書](docs/COVERING_INDEX_DESIGN.md) — Covering Index方式、DML連携、制限事項
+- [バルクインポート設計書](docs/BULK_IMPORT.md) — erdb-cli + Arrow Flight SQL、クライアント検証、制限事項
 
 ## テストコマンド
 
 ```bash
-# 全テスト（123件）
+# 全テスト（144件）
 docker compose run --rm rdb-dev mvn test
 
 # インデックステストのみ
 docker compose run --rm rdb-dev mvn test -Dtest=SecondaryIndexTest
+
+# トランザクション原子性テスト
+docker compose run --rm rdb-dev mvn test -Dtest=TransactionAtomicityTest
 
 # UPDATE/DELETEテストのみ
 docker compose run --rm rdb-dev mvn test -Dtest=UpdateDeleteTest

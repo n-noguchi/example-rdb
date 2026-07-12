@@ -146,3 +146,7 @@ SELECT時、`loadNextBatch()` は1バッチ（最大8192行）のみメモリに
 | UPDATEの算術式 | `SET age = age + 1` 等の式は未対応。リテラル・NULL・カラム参照のみ |
 | DELETE/UPDATEのBase行検索 | Calcite SELECTで該当行を全件スキャンするため、大量データ時は低速 |
 | deletedRowsの線形探索 | Base行の削除判定がO(n)。大量のtombstoneがある場合はスキャン性能に影響 |
+
+### 並行安全性
+
+`deltaRows`/`deletedRows` は `CopyOnWriteArrayList` でスレッドセーフ。`WalBackedCollection.add()/remove()` と各DMLメソッドは `synchronized` で check-then-act 原子性を保証。負荷テスト（5VU × 3分）で `ConcurrentModificationException` ゼロ件を確認済み。

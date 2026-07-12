@@ -21,9 +21,10 @@ services:
       dockerfile: Dockerfile
     environment:
       MAVEN_OPTS: "--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-    command: mvn -q compile exec:java -Dexec.mainClass=com.example.rdb.remote.ExampleAvaticaServer -Dexec.args="--data-dir /app/data --port 8765"
+    command: mvn -q compile exec:java -Dexec.mainClass=com.example.rdb.remote.ExampleRdbServer -Dexec.args="--data-dir /app/data --avatica-port 8765 --flight-port 8815"
     ports:
       - "8765:8765"
+      - "8815:8815"
     volumes:
       - .:/app
       - maven-cache:/root/.m2

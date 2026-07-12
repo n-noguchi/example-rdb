@@ -74,9 +74,13 @@ graph TB
 | MergedEnumerable | Base(Arrow) + Delta(メモリ)のEnumerable連結 | Calcite linq4j | 自作 |
 | Arrow Storage Engine | Arrow IPC形式の読み書き、バッチ書込み、マージ書込み | Apache Arrow Java | 自作 |
 | WAL Manager | 書込みの先行ログ化、チェックポイント、リカバリ | 独自実装 | 自作 |
-| Catalog Manager | テーブル/カラム/主キー定義の永続化 | JSON | 自作 |
+| Catalog Manager | テーブル/カラム/主キー/インデックス定義の永続化 | JSON | 自作 |
 | Transaction Manager | トランザクション管理（AUTOCOMMIT中心） | 独自実装 | 自作 |
+| Covering Index | ソート済みArrow IPCによるCovering Index、Delta Index、tombstone | Apache Arrow Java | 自作 |
 | Avatica HTTP Server | リモートJDBC要求をCalcite JDBCへ中継 | Apache Avatica Jetty | 自作 |
+| Flight SQL Server | Arrow Flight SQL経由のバルクインポート（gRPC :8815） | Apache Arrow Flight | 自作 |
+| ExampleRdbServer | Avatica + Flight SQL統合ランチャー | — | 自作 |
+| erdb-cli | CSV/TSV読込み+全件検証+Flight SQL送信CLI | picocli + Commons CSV | 自作 |
 
 ---
 
@@ -367,19 +371,29 @@ example-rdb/
 ├── docs/
 │   ├── DESIGN.md                         ← 本設計書
 │   ├── SEQUENCE.md                       ← クエリ経路シーケンス図
-│   └── WAL_MMAP_DESIGN.md                ← WAL+mmap方式設計書
+│   ├── WAL_MMAP_DESIGN.md                ← WAL+mmap方式設計書
+│   ├── COVERING_INDEX_DESIGN.md          ← セカンダリインデックス設計書
+│   └── BULK_IMPORT.md                    ← バルクインポート設計書
 ├── src/main/java/com/example/rdb/
 │   ├── ExampleRdb.java                   ← エントリポイント
 │   │
 │   ├── jdbc/
-│   │   └── JdbcDdlSupport.java           ← DDL/CHECKPOINT プロキシ
+│   │   └── JdbcDdlSupport.java           ← DDL/DML/CHECKPOINT/SELECT プロキシ
 │   │
 │   ├── schema/
 │   │   ├── ExampleSchema.java            ← Calcite Schema 実装
-│   │   ├── ExampleTable.java             ← Calcite Table (Base+Delta スキャン)
+│   │   ├── ExampleTable.java             ← Calcite Table (Base+Delta+Index スキャン)
 │   │   ├── ListEnumerable.java           ← List → Enumerable 変換
 │   │   ├── MergedEnumerable.java         ← Base+Delta 連結
-│   │   └── CatalogManager.java           ← カタログ管理
+│   │   └── CatalogManager.java           ← カタログ管理（インデックス定義含む）
+│   │
+│   ├── index/
+│   │   ├── IndexDefinition.java          ← インデックス定義
+│   │   ├── IndexKey.java                 ← 比較可能キー
+│   │   ├── CoveringEntry.java            ← rowId+キー値+INCLUDE値
+│   │   ├── CoveringDeltaIndex.java       ← Delta Index (TreeMap+tombstone)
+│   │   ├── CoveringIndexFile.java        ← Arrow IPC インデックスファイル
+│   │   └── IndexManager.java             ← テーブル単位のインデックス管理
 │   │
 │   ├── storage/
 │   │   ├── ArrowStorage.java             ← Arrow IPC 読み書き (8192行バッチ)
@@ -398,40 +412,73 @@ example-rdb/
 │   │   └── TransactionManager.java       ← トランザクション管理
 │   │
 │   └── remote/
+│       ├── ExampleRdbServer.java         ← 統合ランチャー (Avatica + Flight)
 │       ├── ExampleAvaticaServer.java     ← Avatica HTTP サーバー
-│       └── ExampleJdbcMeta.java          ← Avatica メタデータアダプタ
+│       ├── ExampleJdbcMeta.java          ← Avatica メタデータアダプタ
+│       ├── ExampleFlightSqlServer.java   ← Flight SQL サーバー
+│       └── ErdbFlightSqlProducer.java    ← FlightSqlProducer (Bulk Ingest)
 │
-├── src/test/java/com/example/rdb/        ← テスト
+├── cli/src/main/java/com/example/rdb/cli/
+│   ├── ErdbCli.java                      ← CLIエントリポイント (picocli)
+│   └── ImportCommand.java                ← importサブコマンド
+│
+├── src/test/java/com/example/rdb/        ← テスト (144件)
 │   ├── support/                          ← 組込みクライアントテスト
 │   ├── testclient/                       ← JDBCクライアントテスト
 │   ├── storage/                          ← Arrowストレージテスト
 │   ├── wal/                              ← WALテスト
 │   ├── remote/                           ← リモートサーバーテスト
+│   ├── SecondaryIndexTest.java           ← セカンダリインデックステスト
+│   ├── TransactionAtomicityTest.java     ← トランザクション原子性テスト
+│   ├── OptimisticLockTest.java           ← 楽観ロックテスト
+│   ├── UpdateDeleteTest.java             ← UPDATE/DELETEテスト
 │   ├── MmapPersistenceTest.java          ← mmap永続化テスト
-│   ├── PersistenceRecoveryTest.java      ← 永続化・リカバリテスト
-│   └── ...
+│   └── PersistenceRecoveryTest.java      ← 永続化・リカバリテスト
+│
+├── loadtest/                             ← k6負荷テスト環境
+│   ├── Dockerfile                        ← k6ビルド (xk6-sql + avatica)
+│   ├── docker-compose.yml
+│   └── scripts/                          ← シナリオ1〜7
 │
 └── data/                                 ← 実行時に生成（gitignore対象）
+    ├── tables/                           ← Arrow IPCファイル
+    ├── indexes/                          ← ソート済みインデックスファイル
+    ├── imports/                          ← バルクインポートstaging
+    ├── meta/                             ← catalog.json
+    └── wal/                              ← WALセグメント
 ```
 
 ---
 
 ## 10. 技術スタック
 
-| 項目 | 選択 | バージョン(目安) |
+| 項目 | 選択 | バージョン |
 |---|---|---|
 | 言語 | Java | 17 |
 | ビルド | Maven | 3.9+ |
-| SQLエンジン | Apache Calcite | 1.37.x |
-| JDBCプロトコル | Apache Avatica | 1.23.x |
-| 列指向フォーマット | Apache Arrow Java | 15.x |
-| テスト | JUnit 5 | 5.10.x |
+| SQLエンジン | Apache Calcite | 1.37.0 |
+| JDBCプロトコル | Apache Avatica | 1.23.0 |
+| 列指向フォーマット | Apache Arrow Java | 19.0.0 |
+| バルク転送 | Arrow Flight SQL | 19.0.0 |
+| Protobuf | Google Protobuf | 4.33.4 |
+| CLIフレームワーク | picocli | 4.7.6 |
+| CSVパーサー | Apache Commons CSV | 1.11.0 |
+| テスト | JUnit 5 | 5.10.2 |
+| アサーション | AssertJ | 3.25.3 |
 
 ---
 
 ## 11. トランザクション設計
 
-現段階では **AUTOCOMMIT中心**。将来的な明示的トランザクション拡張も見据えた設計。
+現段階では **AUTOCOMMIT中心**。各INSERT/UPDATE/DELETEは自動的にBEGIN→操作→COMMITのWALレコードとして記録される。
+
+リカバリ時はコミット済みトランザクション（COMMITレコードが存在するTxId）のみ適用され、未コミット・ABORTされたトランザクションは破棄される（原子性担保）。
+
+アプリケーション層の楽観的ロックパターンにも対応:
+```sql
+UPDATE t SET col=val, txn_id=txn_id+1 WHERE id=X AND txn_id=<読み込み時の値>
+```
+影響行数0件で競合を検出。
 
 ```mermaid
 state diagram-v2
@@ -462,8 +509,11 @@ graph LR
     P4["Phase 4<br/>リカバリ<br/>起動時WAL再適用"]
     P5["Phase 5<br/>mmap方式<br/>Base+Delta遅延読込み"]
     P6["Phase 6<br/>UPDATE/DELETE<br/>tombstone + WAL対応"]
+    P7["Phase 7<br/>Covering Index<br/>Arrow sorted index"]
+    P8["Phase 8<br/>Arrow 19 + Flight SQL<br/>バルクインポート"]
+    P9["Phase 9<br/>Tx原子性 + 楽観ロック<br/>CopyOnWriteArrayList"]
 
-    P1 --> P2 --> P3 --> P4 --> P5 --> P6
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8 --> P9
 
     style P1 fill:#2196F3,color:#fff
     style P2 fill:#4CAF50,color:#fff
@@ -471,6 +521,9 @@ graph LR
     style P4 fill:#9C27B0,color:#fff
     style P5 fill:#F44336,color:#fff
     style P6 fill:#795548,color:#fff
+    style P7 fill:#009688,color:#fff
+    style P8 fill:#E91E63,color:#fff
+    style P9 fill:#3F51B5,color:#fff
 ```
 
 | Phase | 内容 | 完了条件 |
@@ -481,3 +534,6 @@ graph LR
 | **4** | リカバリ実装 | 再起動後にデータが復元される |
 | **5** | mmap方式移行（Base+Delta） | 全データをメモリに保持せず、Arrowファイル遅延読込みで動作 |
 | **6** | UPDATE/DELETE対応 | DELETE（tombstone方式）、UPDATE（DELETE+INSERT）、WAL/リカバリ対応 |
+| **7** | セカンダリインデックス（Covering Index） | CREATE INDEX/DROP INDEX、等価・範囲検索、DML連携、永続化 |
+| **8** | Arrow 19アップグレード + Flight SQL バルクインポート | erdb-cli経由でCSVデータをFlight SQLで一括取込 |
+| **9** | トランザクション原子性 + 並行安全性 + 楽観ロック | CopyOnWriteArrayList化、コミット済みTxのみリカバリ、version列ロック |
