@@ -21,9 +21,11 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 
 public class ExampleRdb {
 
@@ -116,7 +118,24 @@ public class ExampleRdb {
 
     private void applyWalRecords() throws IOException {
         List<WalRecord> records = walManager.readAllSegments();
+
+        // First pass: identify committed transactions
+        Set<Integer> committedTxIds = new HashSet<>();
         for (WalRecord record : records) {
+            if (record.getOperation() == WalOperation.COMMIT) {
+                committedTxIds.add(record.getTxId());
+            }
+        }
+
+        // Second pass: apply only records from committed transactions
+        for (WalRecord record : records) {
+            if (record.getOperation() != WalOperation.INSERT && record.getOperation() != WalOperation.DELETE) {
+                continue;
+            }
+            if (!committedTxIds.contains(record.getTxId())) {
+                continue;
+            }
+
             ExampleTable table = schema.getExampleTable(record.getTableName());
             if (table == null || record.getValues() == null) continue;
 
